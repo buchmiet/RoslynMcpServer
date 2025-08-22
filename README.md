@@ -355,4 +355,4 @@ src/RoslynMcpServer/
 
 ## License
 
-[Add your license information here]
+MIT
