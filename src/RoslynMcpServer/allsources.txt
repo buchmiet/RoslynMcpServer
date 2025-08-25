@@ -1,0 +1,3550 @@
+using System.Diagnostics;
+using StreamJsonRpc;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace RoslynMcpServer.Infrastructure
+{
+    public sealed class JsonRpcLoop
+    {
+        public async Task RunAsync(Stream input, Stream output, object target, CancellationToken ct)
+        {
+            // 1) Formatter case-insensitive (ważne dla różnic w casing pól MCP)
+            var formatter = new SystemTextJsonFormatter();
+            formatter.JsonSerializerOptions.PropertyNameCaseInsensitive = true;
+            formatter.JsonSerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
+
+            // 2) NDJSON handler dla stdio (każdy komunikat = jedna linia)
+            // Uwaga: pierwszy parametr = WRITER (writable, STDOUT), drugi = READER (readable, STDIN)
+            var handler = new NewLineDelimitedMessageHandler(output, input, formatter)
+            {
+                NewLine = NewLineDelimitedMessageHandler.NewLineStyle.Lf
+            };
+
+            // 3) JsonRpc + pełny tracing → STDERR (STDOUT musi pozostać sterylny)
+            var rpc = new JsonRpc(handler, target);
+            rpc.TraceSource.Switch.Level = SourceLevels.Verbose;
+            rpc.TraceSource.Listeners.Add(new TextWriterTraceListener(Console.Error));
+            rpc.TraceSource.TraceEvent(TraceEventType.Information, 0, "Trace enabled");
+
+            // 4) Słuchaj i czekaj do końca sesji (zalecany wzorzec)
+            rpc.StartListening();
+            await rpc.Completion;
+        }
+    }
+}
+using System;
+using System.Collections.Generic;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading.Tasks;
+using StreamJsonRpc;
+using RoslynMcpServer.Roslyn;
+using RoslynMcpServer.Tools;
+
+namespace RoslynMcpServer.Infrastructure;
+
+public class McpServer
+{
+    private const string ProtocolVersion = "2025-06-18";
+    private const string ServerName = "roslyn-mcp-server";
+    private const string ServerVersion = "1.0.0";
+    
+    private readonly WorkspaceHost _workspaceHost;
+    private readonly LoadSolutionTool _loadSolutionTool;
+    private readonly TestSymbolFormattingTool _testSymbolFormattingTool;
+    private readonly GetTypeInfoTool _getTypeInfoTool;
+    private readonly FindReferencesTool _findReferencesTool;
+    private readonly DescribeSymbolTool _describeSymbolTool;
+    private readonly GotoDefinitionTool _gotoDefinitionTool;
+    private readonly GetMethodDependenciesTool _getMethodDependenciesTool;
+    private readonly GetInheritanceTreeTool _getInheritanceTreeTool;
+    private readonly GetAllImplementationsTool _getAllImplementationsTool;
+
+    public McpServer()
+    {
+        _workspaceHost = new WorkspaceHost();
+        _loadSolutionTool = new LoadSolutionTool(_workspaceHost);
+        _testSymbolFormattingTool = new TestSymbolFormattingTool(_workspaceHost);
+        _getTypeInfoTool = new GetTypeInfoTool(_workspaceHost);
+        _findReferencesTool = new FindReferencesTool(_workspaceHost);
+        _describeSymbolTool = new DescribeSymbolTool(_workspaceHost);
+        _gotoDefinitionTool = new GotoDefinitionTool(_workspaceHost);
+        _getMethodDependenciesTool = new GetMethodDependenciesTool(_workspaceHost);
+        _getInheritanceTreeTool = new GetInheritanceTreeTool(_workspaceHost);
+        _getAllImplementationsTool = new GetAllImplementationsTool(_workspaceHost);
+    }
+
+    // MCP handshake: catch-all initialize (object params)
+    [JsonRpcMethod("initialize")]
+    public object Initialize(JsonElement anyParams)
+    {
+        // Domyślna wersja, jeśli klient nie przekaże
+        string pv = "2025-06-18";
+
+        if (anyParams.ValueKind == JsonValueKind.Object)
+        {
+            if (anyParams.TryGetProperty("protocolVersion", out var v) && v.ValueKind == JsonValueKind.String)
+                pv = v.GetString()!;
+            else if (anyParams.TryGetProperty("ProtocolVersion", out var v2) && v2.ValueKind == JsonValueKind.String)
+                pv = v2.GetString()!;
+        }
+
+        // Minimalny InitializeResult zgodny ze spec MCP
+        return new
+        {
+            protocolVersion = pv,
+            serverInfo = new { name = "roslyn-index", version = "0.1.0" },
+            capabilities = new
+            {
+                tools = new { },
+                logging = new { },
+                experimental = new { }
+            }
+        };
+    }
+
+    // Wariant pozycyjny (niektóre klienty mogą tak wołać):
+    [JsonRpcMethod("initialize")]
+    public object Initialize(JsonElement a, JsonElement b, JsonElement c)
+    {
+        if (a.ValueKind == JsonValueKind.Object) return Initialize(a);
+        if (c.ValueKind == JsonValueKind.Object) return Initialize(c);
+        return Initialize(new JsonElement());
+    }
+
+    // Object-based initialize (spec-compliant)
+    [JsonRpcMethod("initialize")]
+    public Task<InitializeResult> Initialize(InitializeParams parameters, CancellationToken cancellationToken = default)
+    {
+        return InitializeCore(
+            parameters.ProtocolVersion,
+            parameters.Capabilities,
+            parameters.ClientInfo,
+            cancellationToken,
+            parameters.Capabilities);
+    }
+
+    // Positional 3-parameter initialize (Claude uses this)
+    [JsonRpcMethod("initialize")]
+    public Task<InitializeResult> Initialize(
+        string protocolVersion,
+        ClientCapabilities capabilities,
+        Implementation clientInfo,
+        CancellationToken cancellationToken = default)
+    {
+        return InitializeCore(protocolVersion, capabilities, clientInfo, cancellationToken, capabilities);
+    }
+
+    // Universal 3-parameter initialize (handles any order)
+    [JsonRpcMethod("initialize")]
+    public Task<InitializeResult> Initialize(object a, object b, object c, CancellationToken cancellationToken = default)
+    {
+        // Rozpoznaj kolejność dynamicznie:
+        string? protocolVersion = null;
+        Implementation? clientInfo = null;
+        object? capabilities = null;
+
+        foreach (var arg in new[] { a, b, c })
+        {
+            switch (arg)
+            {
+                case string s:
+                    protocolVersion ??= s;
+                    break;
+                case JsonElement je:
+                    TryClassifyJson(je, ref clientInfo, ref capabilities);
+                    break;
+                default:
+                    if (arg is not null)
+                    {
+                        var je2 = JsonSerializer.SerializeToElement(arg);
+                        TryClassifyJson(je2, ref clientInfo, ref capabilities);
+                    }
+                    break;
+            }
+        }
+
+        protocolVersion ??= "2025-06-18";
+        clientInfo ??= new Implementation { Name = "unknown-client", Version = "0" };
+        capabilities ??= new { };
+
+        return InitializeCore(protocolVersion, new ClientCapabilities { Tools = null, Logging = null, Experimental = null }, clientInfo, cancellationToken, capabilities);
+    }
+
+    private static void TryClassifyJson(JsonElement je, ref Implementation? clientInfo, ref object? capabilities)
+    {
+        // clientInfo: { "name": "...", "version": "..." } i zazwyczaj tylko te dwa pola
+        // capabilities może mieć tools, logging, experimental itp.
+        if (je.ValueKind == JsonValueKind.Object)
+        {
+            bool hasName = je.TryGetProperty("name", out _);
+            bool hasVersion = je.TryGetProperty("version", out _);
+            bool hasTools = je.TryGetProperty("tools", out _);
+            bool hasLogging = je.TryGetProperty("logging", out _);
+            bool hasExperimental = je.TryGetProperty("experimental", out _);
+            
+            // Jeśli ma name i version, ale nie ma typowych pól capabilities, to pewnie clientInfo
+            if (hasName && hasVersion && !hasTools && !hasLogging && !hasExperimental)
+            {
+                try
+                {
+                    var ci = je.Deserialize<Implementation>();
+                    if (ci is not null) 
+                    {
+                        clientInfo ??= ci;
+                        return;
+                    }
+                }
+                catch { /* ignore */ }
+            }
+        }
+        // w pozostałych przypadkach traktuj jako capabilities (dowolny kształt)
+        capabilities ??= je;
+    }
+
+    private Task<InitializeResult> InitializeCore(
+        string protocolVersion,
+        ClientCapabilities? capabilities,
+        object? clientInfo,
+        CancellationToken cancellationToken,
+        object? rawCapabilities = null)
+    {
+        // For MVP, we'll accept the client's protocol version if it's compatible
+        // In production, you'd negotiate the version properly
+        var negotiatedVersion = protocolVersion;
+        
+        var result = new InitializeResult
+        {
+            ProtocolVersion = negotiatedVersion,
+            ServerInfo = new Implementation
+            {
+                Name = "RoslynMcpServer",
+                Version = "0.1.0"
+            },
+            Capabilities = new ServerCapabilities
+            {
+                Tools = new ToolsCapability { ListChanged = false },
+                Experimental = new { }
+            },
+            Instructions = "Use tools/list then tools/call; load_solution first."
+        };
+        
+        return Task.FromResult(result);
+    }
+
+    // Handle initialized notification (no response)
+    [JsonRpcMethod("initialized")]
+    public void Initialized(object? parameters = null)
+    {
+        // Client has acknowledged initialization
+        // Could log or set a flag here if needed
+    }
+
+    [JsonRpcMethod("tools/list", UseSingleObjectParameterDeserialization = true)]
+    public Task<ToolsListResult> ListTools(JsonElement? _ = default, CancellationToken cancellationToken = default)
+    {
+        // Console.Error.WriteLine("MCP ListTools called");
+        
+        var tools = new List<Tool>
+        {
+            new Tool
+            {
+                Name = "load_solution",
+                Description = "Load a .NET solution (.sln) or project file (.csproj) for analysis",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        path = new
+                        {
+                            type = "string",
+                            description = "Path to the .sln or .csproj file"
+                        }
+                    },
+                    required = new[] { "path" }
+                }
+            },
+            new Tool
+            {
+                Name = "get_type_info",
+                Description = "Get detailed information about a type including members, inheritance, and documentation",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new
+                        {
+                            type = "string",
+                            description = "Fully qualified name of the type (e.g., System.String, MyNamespace.MyClass)"
+                        },
+                        page = new
+                        {
+                            type = "integer",
+                            description = "Page number (1-based)",
+                            minimum = 1,
+                            @default = 1
+                        },
+                        pageSize = new
+                        {
+                            type = "integer",
+                            description = "Number of results per page",
+                            minimum = 1,
+                            maximum = 500,
+                            @default = 200
+                        }
+                    },
+                    required = new[] { "fullyQualifiedName" }
+                }
+            },
+            new Tool
+            {
+                Name = "get_inheritance_tree",
+                Description = "Return full inheritance tree (ancestors, interfaces, descendants; optional overrides)",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new { type = "string" },
+                        file = new { type = "string" },
+                        line = new { type = "integer", minimum = 1 },
+                        column = new { type = "integer", minimum = 1 },
+                        direction = new { type = "string", enumValues = new[] { "both", "ancestors", "descendants" }, _default = "both" },
+                        includeInterfaces = new { type = "boolean", _default = true },
+                        includeOverrides = new { type = "boolean", _default = false },
+                        maxDepth = new { type = "integer", minimum = 1, maximum = 100, _default = 10 },
+                        solutionOnly = new { type = "boolean", _default = true },
+                        page = new { type = "integer", minimum = 1, _default = 1 },
+                        pageSize = new { type = "integer", minimum = 1, maximum = 500, _default = 200 },
+                        timeoutMs = new { type = "integer", minimum = 1000, maximum = 300000, _default = 60000 }
+                    },
+                    anyOf = new object[]
+                    {
+                        new { required = new[] { "fullyQualifiedName" } },
+                        new { required = new[] { "file", "line", "column" } }
+                    }
+                }
+            },
+            new Tool
+            {
+                Name = "get_all_implementations",
+                Description = "List all implementations of an interface, or implementations of a specific interface member",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new { type = "string" },
+                        file = new { type = "string" },
+                        line = new { type = "integer", minimum = 1 },
+                        column = new { type = "integer", minimum = 1 },
+                        member = new { type = "string", description = "Optional member name when FQN targets interface type" },
+                        solutionOnly = new { type = "boolean", _default = true },
+                        includeDerivedInterfaces = new { type = "boolean", _default = true },
+                        page = new { type = "integer", minimum = 1, _default = 1 },
+                        pageSize = new { type = "integer", minimum = 1, maximum = 500, _default = 200 },
+                        timeoutMs = new { type = "integer", minimum = 1000, maximum = 300000, _default = 60000 }
+                    },
+                    anyOf = new object[]
+                    {
+                        new { required = new[] { "fullyQualifiedName" } },
+                        new { required = new[] { "file", "line", "column" } }
+                    }
+                }
+            },
+            new Tool
+            {
+                Name = "find_references",
+                Description = "Find all references to a symbol in the loaded solution",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new
+                        {
+                            type = "string",
+                            description = "Fully qualified name of the symbol"
+                        },
+                        page = new
+                        {
+                            type = "integer",
+                            description = "Page number (1-based)",
+                            minimum = 1,
+                            @default = 1
+                        },
+                        pageSize = new
+                        {
+                            type = "integer",
+                            description = "Number of results per page",
+                            minimum = 1,
+                            maximum = 500,
+                            @default = 200
+                        },
+                        timeoutMs = new
+                        {
+                            type = "integer",
+                            description = "Timeout in milliseconds",
+                            minimum = 1000,
+                            maximum = 300000,
+                            @default = 60000
+                        }
+                    },
+                    required = new[] { "fullyQualifiedName" }
+                }
+            },
+            new Tool
+            {
+                Name = "test_symbol_formatting",
+                Description = "Test tool to demonstrate symbol formatting with location info",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new { },
+                    required = new string[] { }
+                }
+            },
+            new Tool
+            {
+                Name = "describe_symbol",
+                Description = "Get detailed information about a symbol by fully qualified name or file position",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new
+                        {
+                            type = "string",
+                            description = "Fully qualified name of the symbol (provide this OR file/line/column)"
+                        },
+                        file = new
+                        {
+                            type = "string",
+                            description = "File path (use with line and column)"
+                        },
+                        line = new
+                        {
+                            type = "integer",
+                            description = "Line number 1-based (use with file and column)"
+                        },
+                        column = new
+                        {
+                            type = "integer",
+                            description = "Column number 1-based (use with file and line)"
+                        }
+                    }
+                }
+            },
+            new Tool
+            {
+                Name = "goto_definition",
+                Description = "Find the source definition of a symbol",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new
+                        {
+                            type = "string",
+                            description = "Fully qualified name of the symbol"
+                        }
+                    },
+                    required = new[] { "fullyQualifiedName" }
+                }
+            },
+            new Tool
+            {
+                Name = "get_method_dependencies",
+                Description = "Analyze method dependencies: calls, reads/writes of fields/properties; optional callers",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new { type = "string", description = "Fully qualified name (or use file/line/column)" },
+                        file = new { type = "string" },
+                        line = new { type = "integer", minimum = 1 },
+                        column = new { type = "integer", minimum = 1 },
+                        depth = new { type = "integer", minimum = 1, @default = 1 },
+                        includeCallers = new { type = "boolean", @default = false },
+                        treatPropertiesAsMethods = new { type = "boolean", @default = true },
+                        page = new { type = "integer", minimum = 1, @default = 1 },
+                        pageSize = new { type = "integer", minimum = 1, maximum = 500, @default = 200 },
+                        timeoutMs = new { type = "integer", minimum = 1000, maximum = 300000, @default = 60000 }
+                    },
+                    anyOf = new object[]
+                    {
+                        new { required = new[] { "fullyQualifiedName" } },
+                        new { required = new[] { "file", "line", "column" } }
+                    }
+                }
+            }
+
+        };
+
+        return Task.FromResult(new ToolsListResult { Tools = tools });
+    }
+
+
+    // tools/call – wariant 2-parametrowy (dopasowanie do named args: { name, arguments })
+    [JsonRpcMethod("tools/call")]
+    public Task<ToolCallResult> CallTool(string name, JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        var p = new ToolCallParams { Name = name, Arguments = arguments };
+        return CallTool(p, cancellationToken);
+    }
+
+    [JsonRpcMethod("tools/call", UseSingleObjectParameterDeserialization = true)]
+    public async Task<ToolCallResult> CallTool(ToolCallParams parameters, CancellationToken cancellationToken = default)
+    {
+        // Console.Error.WriteLine($"MCP CallTool called: name={parameters?.Name}, arguments={parameters?.Arguments?.ToString() ?? "null"}");
+        
+        var name = parameters?.Name;
+        var arguments = parameters?.Arguments;
+        
+        switch (name)
+        {
+            case "load_solution":
+                return await _loadSolutionTool.ExecuteAsync(arguments);
+                
+            case "test_symbol_formatting":
+                return await _testSymbolFormattingTool.ExecuteAsync(arguments);
+                
+            case "get_type_info":
+                return await _getTypeInfoTool.ExecuteAsync(arguments);
+                
+            case "find_references":
+                return await _findReferencesTool.ExecuteAsync(arguments, cancellationToken);
+            
+            case "describe_symbol":
+                return await _describeSymbolTool.ExecuteAsync(arguments, cancellationToken);
+            
+            case "goto_definition":
+                return await _gotoDefinitionTool.ExecuteAsync(arguments, cancellationToken);
+            
+            case "get_method_dependencies":
+                return await _getMethodDependenciesTool.ExecuteAsync(arguments, cancellationToken);
+
+            case "get_inheritance_tree":
+                return await _getInheritanceTreeTool.ExecuteAsync(arguments, cancellationToken);
+
+            case "get_all_implementations":
+                return await _getAllImplementationsTool.ExecuteAsync(arguments, cancellationToken);
+
+            default:
+                return new ToolCallResult
+                {
+                    IsError = true,
+                    Content =
+                    [
+                        new ToolContent
+                        {
+                            Type = "text",
+                            Text = $"Unknown tool: {name}"
+                        }
+                    ]
+                };
+        }
+    }
+
+    // Positional 3-parameter overload: [name, arguments, options]
+    [JsonRpcMethod("tools/call")]
+    public Task<ToolCallResult> CallTool(string name, JsonElement? arguments, JsonElement? _ignoredOptions, CancellationToken cancellationToken = default)
+    {
+        var p = new ToolCallParams { Name = name, Arguments = arguments };
+        return CallTool(p, cancellationToken);
+    }
+}
+
+#region MCP Protocol Types
+
+// Implementation type used for both clientInfo and serverInfo
+public class Implementation
+{
+    [JsonPropertyName("name")]
+    public required string Name { get; set; }
+
+    [JsonPropertyName("version")]
+    public required string Version { get; set; }
+}
+
+public class ClientCapabilities
+{
+    [JsonPropertyName("tools")]
+    public object? Tools { get; set; }
+    
+    [JsonPropertyName("logging")]
+    public object? Logging { get; set; }
+    
+    [JsonPropertyName("experimental")]
+    public object? Experimental { get; set; }
+}
+
+public class InitializeParams
+{
+    [JsonPropertyName("protocolVersion")]
+    public required string ProtocolVersion { get; set; }
+
+    [JsonPropertyName("clientInfo")]
+    public required Implementation ClientInfo { get; set; }
+
+    [JsonPropertyName("capabilities")]
+    public required ClientCapabilities Capabilities { get; set; }
+}
+
+public class InitializeResult
+{
+    [JsonPropertyName("protocolVersion")]
+    public required string ProtocolVersion { get; set; }
+
+    [JsonPropertyName("serverInfo")]
+    public required Implementation ServerInfo { get; set; }
+
+    [JsonPropertyName("capabilities")]
+    public required ServerCapabilities Capabilities { get; set; }
+    
+    [JsonPropertyName("instructions")]
+    public string? Instructions { get; set; }
+    
+    [JsonPropertyName("_meta")]
+    public Dictionary<string, object>? Meta { get; set; }
+}
+
+public class ServerCapabilities
+{
+    [JsonPropertyName("tools")]
+    public ToolsCapability? Tools { get; set; }
+    
+    [JsonPropertyName("resources")]
+    public object? Resources { get; set; }
+    
+    [JsonPropertyName("prompts")]
+    public object? Prompts { get; set; }
+    
+    [JsonPropertyName("logging")]
+    public object? Logging { get; set; }
+    
+    [JsonPropertyName("experimental")]
+    public object? Experimental { get; set; }
+}
+
+public class ToolsCapability
+{
+    [JsonPropertyName("listChanged")]
+    public bool ListChanged { get; set; }
+}
+
+public class ToolsListResult
+{
+    [JsonPropertyName("tools")]
+    public required List<Tool> Tools { get; set; }
+}
+
+public class Tool
+{
+    [JsonPropertyName("name")]
+    public required string Name { get; set; }
+
+    [JsonPropertyName("description")]
+    public required string Description { get; set; }
+
+    [JsonPropertyName("inputSchema")]
+    public required object InputSchema { get; set; }
+}
+
+public class ToolCallParams
+{
+    [JsonPropertyName("name")]
+    public required string Name { get; set; }
+
+    [JsonPropertyName("arguments")]
+    public JsonElement? Arguments { get; set; }
+}
+
+public class ToolCallResult
+{
+    [JsonPropertyName("content")]
+    public required List<ToolContent> Content { get; set; }
+
+    [JsonPropertyName("isError")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? IsError { get; set; }
+    
+    [JsonPropertyName("structuredContent")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public object? StructuredContent { get; set; }
+}
+
+public class ToolContent
+{
+    [JsonPropertyName("type")]
+    public required string Type { get; set; }
+
+    [JsonPropertyName("text")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Text { get; set; }
+}
+
+#endregion
+// <autogenerated />
+using System;
+using System.Reflection;
+[assembly: global::System.Runtime.Versioning.TargetFrameworkAttribute(".NETCoreApp,Version=v9.0", FrameworkDisplayName = ".NET 9.0")]
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+using System;
+using System.Reflection;
+
+[assembly: System.Reflection.AssemblyCompanyAttribute("RoslynMcpServer")]
+[assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
+[assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+3b6b4612eee4a7708f1f14599950a36a26bb082e")]
+[assembly: System.Reflection.AssemblyProductAttribute("RoslynMcpServer")]
+[assembly: System.Reflection.AssemblyTitleAttribute("RoslynMcpServer")]
+[assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
+
+// Generated by the MSBuild WriteCodeFragment class.
+
+// <auto-generated/>
+global using global::System;
+global using global::System.Collections.Generic;
+global using global::System.IO;
+global using global::System.Linq;
+global using global::System.Net.Http;
+global using global::System.Threading;
+global using global::System.Threading.Tasks;
+// <autogenerated />
+using System;
+using System.Reflection;
+[assembly: global::System.Runtime.Versioning.TargetFrameworkAttribute(".NETCoreApp,Version=v9.0", FrameworkDisplayName = ".NET 9.0")]
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+using System;
+using System.Reflection;
+
+[assembly: System.Reflection.AssemblyCompanyAttribute("RoslynMcpServer")]
+[assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
+[assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+3b6b4612eee4a7708f1f14599950a36a26bb082e")]
+[assembly: System.Reflection.AssemblyProductAttribute("RoslynMcpServer")]
+[assembly: System.Reflection.AssemblyTitleAttribute("RoslynMcpServer")]
+[assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
+
+// Generated by the MSBuild WriteCodeFragment class.
+
+// <auto-generated/>
+global using global::System;
+global using global::System.Collections.Generic;
+global using global::System.IO;
+global using global::System.Linq;
+global using global::System.Net.Http;
+global using global::System.Threading;
+global using global::System.Threading.Tasks;
+using System;
+using System.Threading.Tasks;
+using RoslynMcpServer.Infrastructure;
+
+namespace RoslynMcpServer;
+
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        // Wyciszenie banerów/telemetrii .NET
+        Environment.SetEnvironmentVariable("DOTNET_NOLOGO", "1");
+        Environment.SetEnvironmentVariable("DOTNET_CLI_TELEMETRY_OPTOUT", "1");
+
+        try
+        {
+            // Krótki log na STDERR (stdout MUSI być czysty dla MCP)
+            Console.Error.WriteLine("MCP: starting (NDJSON over stdio)...");
+            
+            var mcpServer  = new McpServer();
+            var jsonRpcLoop = new JsonRpcLoop();
+
+            Console.Error.WriteLine("MCP: listening...");
+            await jsonRpcLoop.RunAsync(
+                Console.OpenStandardInput(),
+                Console.OpenStandardOutput(),
+                mcpServer,
+                default);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Fatal error: {ex}");
+            Environment.Exit(1);
+        }
+    }
+}
+using System.Linq;
+using Microsoft.CodeAnalysis;
+
+namespace RoslynMcpServer.Roslyn;
+
+public static class SymbolFormatting
+{
+    /// <summary>
+    /// Describes a symbol with its display string and source location.
+    /// </summary>
+    /// <param name="symbol">The symbol to describe</param>
+    /// <returns>Object containing display string and location info (file, line, column)</returns>
+    public static SymbolDescription Describe(ISymbol symbol)
+    {
+        if (symbol == null)
+        {
+            return new SymbolDescription
+            {
+                Display = "<null>",
+                File = null,
+                Line = -1,
+                Column = -1
+            };
+        }
+
+        // Get fully qualified display string
+        var displayFormat = SymbolDisplayFormat.FullyQualifiedFormat
+            .WithMemberOptions(
+                SymbolDisplayMemberOptions.IncludeType |
+                SymbolDisplayMemberOptions.IncludeParameters |
+                SymbolDisplayMemberOptions.IncludeContainingType)
+            .WithKindOptions(SymbolDisplayKindOptions.IncludeTypeKeyword)
+            .WithGenericsOptions(
+                SymbolDisplayGenericsOptions.IncludeTypeParameters |
+                SymbolDisplayGenericsOptions.IncludeTypeConstraints)
+            .WithMiscellaneousOptions(
+                SymbolDisplayMiscellaneousOptions.UseSpecialTypes |
+                SymbolDisplayMiscellaneousOptions.IncludeNullableReferenceTypeModifier);
+
+        var display = symbol.ToDisplayString(displayFormat);
+
+        // Find source location if available
+        var sourceLocation = symbol.Locations.FirstOrDefault(loc => loc.IsInSource);
+        
+        if (sourceLocation != null)
+        {
+            var lineSpan = sourceLocation.GetLineSpan();
+            
+            return new SymbolDescription
+            {
+                Display = display,
+                File = lineSpan.Path,
+                // Line and column are 0-based in Roslyn, but we want 1-based for display
+                Line = lineSpan.StartLinePosition.Line + 1,
+                Column = lineSpan.StartLinePosition.Character + 1
+            };
+        }
+
+        // No source location available (e.g., metadata symbols)
+        return new SymbolDescription
+        {
+            Display = display,
+            File = null,
+            Line = -1,
+            Column = -1
+        };
+    }
+}
+
+/// <summary>
+/// Represents a symbol description with display string and location.
+/// </summary>
+public class SymbolDescription
+{
+    /// <summary>
+    /// Fully qualified display string of the symbol
+    /// </summary>
+    public required string Display { get; set; }
+    
+    /// <summary>
+    /// Source file path if available, null otherwise
+    /// </summary>
+    public string? File { get; set; }
+    
+    /// <summary>
+    /// Line number (1-based) if in source, -1 otherwise
+    /// </summary>
+    public required int Line { get; set; }
+    
+    /// <summary>
+    /// Column number (1-based) if in source, -1 otherwise
+    /// </summary>
+    public required int Column { get; set; }
+
+    /// <summary>
+    /// Returns a formatted string representation of the symbol description
+    /// </summary>
+    public override string ToString()
+    {
+        if (File != null)
+        {
+            return $"{Display} at {File}:{Line}:{Column}";
+        }
+        return Display;
+    }
+}using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Microsoft.Build.Locator;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.MSBuild;
+
+namespace RoslynMcpServer.Roslyn;
+
+public class WorkspaceHost
+{
+    private MSBuildWorkspace? _workspace;
+    private Solution? _solution;
+    private string? _loadMode;
+    private readonly object _lock = new();
+    private static bool _msbuildRegistered = false;
+
+    static WorkspaceHost()
+    {
+        if (!_msbuildRegistered)
+        {
+            try
+            {
+                // Console.Error.WriteLine("Registering MSBuild...");
+                
+                // Try to find Visual Studio instances first
+                var instances = MSBuildLocator.QueryVisualStudioInstances().ToList();
+                
+                if (instances.Any())
+                {
+                    // Choose the latest version
+                    var latestInstance = instances.OrderByDescending(x => x.Version).First();
+                    // Console.Error.WriteLine($"Found {instances.Count} VS instance(s), using: {latestInstance.Name} {latestInstance.Version} at {latestInstance.MSBuildPath}");
+                    MSBuildLocator.RegisterInstance(latestInstance);
+                }
+                else
+                {
+                    // Fallback for Linux/WSL without VS
+                    // Console.Error.WriteLine("No VS instances found, using MSBuild defaults (Linux/WSL mode)");
+                    MSBuildLocator.RegisterDefaults();
+                }
+                
+                _msbuildRegistered = true;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Failed to register MSBuild: {ex.Message}");
+            }
+        }
+    }
+
+    public async Task<bool> OpenSolutionAsync(string path, CancellationToken cancellationToken = default, int timeoutMs = 90000)
+    {
+        try
+        {
+            Console.Error.WriteLine($"Opening: {path}");
+            
+            lock (_lock)
+            {
+                _workspace?.Dispose();
+                _workspace = MSBuildWorkspace.Create();
+                _loadMode = null;
+                
+                _workspace.WorkspaceFailed += (sender, args) =>
+                {
+                    Console.Error.WriteLine($"Workspace failed: [{args.Diagnostic.Kind}] {args.Diagnostic.Message}");
+                };
+            }
+
+            // Create progress reporter
+            var progressReporter = new Progress<ProjectLoadProgress>(progress =>
+            {
+                var tfm = progress.TargetFramework ?? "unknown";
+                Console.Error.WriteLine($"Loading {progress.FilePath} ({tfm})");
+            });
+
+            // Create timeout cancellation token
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(timeoutMs);
+
+            try
+            {
+                // Determine if it's a solution or project file
+                var extension = Path.GetExtension(path).ToLowerInvariant();
+                
+                if (extension == ".sln")
+                {
+                    Console.Error.WriteLine("Loading as solution file...");
+                    _solution = await _workspace.OpenSolutionAsync(path, progressReporter, cts.Token).ConfigureAwait(false);
+                    _loadMode = "native";
+                }
+                else if (extension == ".slnx")
+                {
+                    Console.Error.WriteLine("Loading as .slnx file...");
+                    // Try native loading first
+                    try
+                    {
+                        _solution = await _workspace.OpenSolutionAsync(path, progressReporter, cts.Token).ConfigureAwait(false);
+                        if (_solution?.Projects.Any() == true)
+                        {
+                            _loadMode = "native";
+                            Console.Error.WriteLine($"Successfully loaded .slnx using native mode");
+                        }
+                        else
+                        {
+                            throw new InvalidOperationException("Native loading returned empty solution");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"Native .slnx loading failed: {ex.Message}, trying fallback...");
+                        _solution = await LoadSlnxWithFallbackAsync(path, progressReporter, cts.Token).ConfigureAwait(false);
+                        _loadMode = "slnx-fallback";
+                    }
+                }
+                else if (extension == ".csproj" || extension == ".vbproj" || extension == ".fsproj")
+                {
+                    Console.Error.WriteLine("Loading as project file...");
+                    var project = await _workspace.OpenProjectAsync(path, progressReporter, cts.Token).ConfigureAwait(false);
+                    _solution = project?.Solution;
+                    _loadMode = "project";
+                }
+                else
+                {
+                    Console.Error.WriteLine($"Unsupported file extension: {extension}");
+                    return false;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                Console.Error.WriteLine($"Loading timed out after {timeoutMs}ms");
+                return false;
+            }
+
+            // Set solution to current workspace solution
+            if (_solution == null)
+            {
+                _solution = _workspace.CurrentSolution;
+            }
+
+            var projectCount = _solution?.Projects.Count() ?? 0;
+            Console.Error.WriteLine($"Solution loaded: {_solution?.FilePath ?? path}");
+            Console.Error.WriteLine($"Projects count: {projectCount}");
+            
+            // Return true if we have at least one project
+            return projectCount > 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to open: {ex.Message}");
+            Console.Error.WriteLine($"Stack trace: {ex.StackTrace}");
+            return false;
+        }
+    }
+
+    private async Task<Solution?> LoadSlnxWithFallbackAsync(string slnxPath, IProgress<ProjectLoadProgress> progressReporter, CancellationToken cancellationToken)
+    {
+        Console.Error.WriteLine($"Loading .slnx with XML fallback: {slnxPath}");
+        
+        try
+        {
+            // Parse the .slnx XML file
+            var doc = XDocument.Load(slnxPath);
+            var projectPaths = new List<string>();
+            
+            // Extract project paths from XML
+            // Looking for <Project Path="..."> elements
+            var projectElements = doc.Descendants("Project")
+                .Where(e => e.Attribute("Path") != null)
+                .Select(e => e.Attribute("Path")!.Value);
+            
+            foreach (var relativePath in projectElements)
+            {
+                var fullPath = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(slnxPath)!, relativePath));
+                if (File.Exists(fullPath))
+                {
+                    projectPaths.Add(fullPath);
+                    Console.Error.WriteLine($"Found project in .slnx: {fullPath}");
+                }
+                else
+                {
+                    Console.Error.WriteLine($"Warning: Project file not found: {fullPath}");
+                }
+            }
+            
+            if (!projectPaths.Any())
+            {
+                Console.Error.WriteLine("No valid project paths found in .slnx file");
+                return null;
+            }
+            
+            // Start with empty solution
+            var solution = _workspace!.CurrentSolution;
+            
+            // Load each project and add to solution
+            foreach (var projectPath in projectPaths)
+            {
+                try
+                {
+                    Console.Error.WriteLine($"Loading project: {projectPath}");
+                    var project = await _workspace.OpenProjectAsync(projectPath, progressReporter, cancellationToken).ConfigureAwait(false);
+                    
+                    if (project != null)
+                    {
+                        // Get the updated solution that contains this project
+                        solution = project.Solution;
+                        Console.Error.WriteLine($"Added project to solution: {project.Name}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"Failed to load project {projectPath}: {ex.Message}");
+                    // Continue with other projects
+                }
+            }
+            
+            Console.Error.WriteLine($"Fallback loading completed with {solution.Projects.Count()} projects");
+            return solution;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to parse .slnx file: {ex.Message}");
+            return null;
+        }
+    }
+    
+    public Solution? GetSolution()
+    {
+        lock (_lock)
+        {
+            return _solution;
+        }
+    }
+    
+    public string? GetLoadMode()
+    {
+        lock (_lock)
+        {
+            return _loadMode;
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            _workspace?.Dispose();
+            _workspace = null;
+            _solution = null;
+        }
+    }
+}using System;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.FindSymbols;
+using Microsoft.CodeAnalysis.Text;
+using RoslynMcpServer.Infrastructure;
+using RoslynMcpServer.Roslyn;
+
+namespace RoslynMcpServer.Tools;
+
+public class DescribeSymbolTool
+{
+    private readonly WorkspaceHost _workspaceHost;
+
+    public DescribeSymbolTool(WorkspaceHost workspaceHost)
+    {
+        _workspaceHost = workspaceHost ?? throw new ArgumentNullException(nameof(workspaceHost));
+    }
+
+    public async Task<ToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (!arguments.HasValue || arguments.Value.ValueKind == JsonValueKind.Null)
+            {
+                return CreateErrorResult("Missing arguments");
+            }
+
+            var solution = _workspaceHost.GetSolution();
+            if (solution == null)
+            {
+                return CreateErrorResult("No solution loaded. Please load a solution first.");
+            }
+
+            ISymbol? symbol = null;
+
+            // Check for fullyQualifiedName mode
+            if (arguments.Value.TryGetProperty("fullyQualifiedName", out var fqnElement))
+            {
+                var fullyQualifiedName = fqnElement.GetString();
+                if (string.IsNullOrEmpty(fullyQualifiedName))
+                {
+                    return CreateErrorResult("fullyQualifiedName cannot be empty");
+                }
+
+                Console.Error.WriteLine($"DescribeSymbol: Finding by FQN={fullyQualifiedName}");
+
+                // Find symbol by FQN
+                foreach (var project in solution.Projects)
+                {
+                    var compilation = await project.GetCompilationAsync(cancellationToken);
+                    if (compilation == null) continue;
+
+                    symbol = compilation.GetTypeByMetadataName(fullyQualifiedName);
+                    if (symbol != null)
+                    {
+                        Console.Error.WriteLine($"Found type symbol in project: {project.Name}");
+                        break;
+                    }
+
+                    // Try to find method or property by parsing the name
+                    if (fullyQualifiedName.Contains("."))
+                    {
+                        var lastDot = fullyQualifiedName.LastIndexOf('.');
+                        if (lastDot > 0)
+                        {
+                            var typeName = fullyQualifiedName.Substring(0, lastDot);
+                            var memberName = fullyQualifiedName.Substring(lastDot + 1);
+                            
+                            // Remove method parameters if present
+                            var parenIndex = memberName.IndexOf('(');
+                            if (parenIndex > 0)
+                            {
+                                memberName = memberName.Substring(0, parenIndex);
+                            }
+
+                            var type = compilation.GetTypeByMetadataName(typeName);
+                            if (type != null)
+                            {
+                                symbol = type.GetMembers(memberName).FirstOrDefault();
+                                if (symbol != null)
+                                {
+                                    Console.Error.WriteLine($"Found member symbol in project: {project.Name}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (symbol == null)
+                {
+                    return CreateErrorResult($"Symbol not found: {fullyQualifiedName}");
+                }
+            }
+            // Check for file:line:column mode
+            else if (arguments.Value.TryGetProperty("file", out var fileElement) &&
+                     arguments.Value.TryGetProperty("line", out var lineElement) &&
+                     arguments.Value.TryGetProperty("column", out var columnElement))
+            {
+                var file = fileElement.GetString();
+                if (string.IsNullOrEmpty(file))
+                {
+                    return CreateErrorResult("file cannot be empty");
+                }
+
+                if (lineElement.ValueKind != JsonValueKind.Number || columnElement.ValueKind != JsonValueKind.Number)
+                {
+                    return CreateErrorResult("line and column must be numbers");
+                }
+
+                var line = lineElement.GetInt32();
+                var column = columnElement.GetInt32();
+
+                Console.Error.WriteLine($"DescribeSymbol: Finding at {file}:{line}:{column}");
+
+                // Find document by file path
+                Document? document = null;
+                foreach (var project in solution.Projects)
+                {
+                    foreach (var doc in project.Documents)
+                    {
+                        var docPath = doc.FilePath;
+                        if (docPath != null && Path.GetFullPath(docPath) == Path.GetFullPath(file))
+                        {
+                            document = doc;
+                            break;
+                        }
+                    }
+                    if (document != null) break;
+                }
+
+                if (document == null)
+                {
+                    return CreateErrorResult($"Document not found: {file}");
+                }
+
+                // Convert line:column (1-based) to position (0-based)
+                var text = await document.GetTextAsync(cancellationToken);
+                var position = text.Lines.GetPosition(new LinePosition(line - 1, column - 1));
+
+                // Find symbol at position
+                var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
+                if (semanticModel != null)
+                {
+                    symbol = await SymbolFinder.FindSymbolAtPositionAsync(semanticModel, position, solution.Workspace, cancellationToken);
+                }
+
+                if (symbol == null)
+                {
+                    return CreateErrorResult($"No symbol found at {file}:{line}:{column}");
+                }
+            }
+            else
+            {
+                return CreateErrorResult("Either 'fullyQualifiedName' or 'file', 'line', 'column' must be provided");
+            }
+
+            // Describe the symbol
+            var description = SymbolFormatting.Describe(symbol);
+            var result = new
+            {
+                success = true,
+                display = description.Display,
+                file = description.File,
+                line = description.Line,
+                column = description.Column,
+                kind = symbol.Kind.ToString(),
+                containingType = symbol.ContainingType?.ToDisplayString(),
+                containingNamespace = symbol.ContainingNamespace?.ToDisplayString()
+            };
+
+            var elem = JsonSerializer.SerializeToElement(result);
+            return new ToolCallResult
+            {
+                Content = new[]
+                {
+                    new ToolContent
+                    {
+                        Type = "text",
+                        Text = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true })
+                    }
+                }.ToList(),
+                StructuredContent = elem
+            };
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"DescribeSymbolTool error: {ex}");
+            return CreateErrorResult($"Exception: {ex.Message}");
+        }
+    }
+
+    private ToolCallResult CreateErrorResult(string message)
+    {
+        var result = new { success = false, error = message };
+        
+        return new ToolCallResult
+        {
+            IsError = true,
+            Content = new[]
+            {
+                new ToolContent
+                {
+                    Type = "text",
+                    Text = JsonSerializer.Serialize(result)
+                }
+            }.ToList()
+        };
+    }
+}
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.FindSymbols;
+using RoslynMcpServer.Infrastructure;
+using RoslynMcpServer.Roslyn;
+
+namespace RoslynMcpServer.Tools;
+
+public class FindReferencesTool
+{
+    private readonly WorkspaceHost _workspaceHost;
+
+    public FindReferencesTool(WorkspaceHost workspaceHost)
+    {
+        _workspaceHost = workspaceHost ?? throw new ArgumentNullException(nameof(workspaceHost));
+    }
+
+    public async Task<ToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            // Parse arguments
+            if (!arguments.HasValue || arguments.Value.ValueKind == JsonValueKind.Null)
+            {
+                return CreateErrorResult("Missing arguments");
+            }
+
+            if (!arguments.Value.TryGetProperty("fullyQualifiedName", out var fqnElement))
+            {
+                return CreateErrorResult("Missing 'fullyQualifiedName' argument");
+            }
+
+            var fullyQualifiedName = fqnElement.GetString();
+            if (string.IsNullOrEmpty(fullyQualifiedName))
+            {
+                return CreateErrorResult("fullyQualifiedName cannot be empty");
+            }
+
+            // Parse pagination parameters
+            int page = 1;
+            int pageSize = 200;
+            int timeoutMs = 60000;
+
+            if (arguments.Value.TryGetProperty("page", out var pageElement))
+            {
+                // Handle both page number and cursor token
+                if (pageElement.ValueKind == JsonValueKind.String)
+                {
+                    var cursor = pageElement.GetString();
+                    if (!string.IsNullOrEmpty(cursor))
+                    {
+                        try
+                        {
+                            var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(cursor));
+                            var cursorData = JsonSerializer.Deserialize<Dictionary<string, int>>(decoded);
+                            if (cursorData != null && cursorData.TryGetValue("offset", out var offset))
+                            {
+                                page = (offset / pageSize) + 1;
+                            }
+                        }
+                        catch
+                        {
+                            // Invalid cursor, use default
+                        }
+                    }
+                }
+                else if (pageElement.ValueKind == JsonValueKind.Number)
+                {
+                    page = Math.Max(1, pageElement.GetInt32());
+                }
+            }
+
+            if (arguments.Value.TryGetProperty("pageSize", out var pageSizeElement) && pageSizeElement.ValueKind == JsonValueKind.Number)
+            {
+                pageSize = Math.Min(500, Math.Max(1, pageSizeElement.GetInt32()));
+            }
+
+            if (arguments.Value.TryGetProperty("timeoutMs", out var timeoutElement) && timeoutElement.ValueKind == JsonValueKind.Number)
+            {
+                timeoutMs = Math.Min(300000, Math.Max(1000, timeoutElement.GetInt32()));
+            }
+
+            Console.Error.WriteLine($"FindReferences: FQN={fullyQualifiedName}, page={page}, pageSize={pageSize}, timeout={timeoutMs}ms");
+
+            // Create timeout cancellation token
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(timeoutMs);
+
+            // Get current solution
+            var solution = _workspaceHost.GetSolution();
+            if (solution == null)
+            {
+                return CreateErrorResult("No solution loaded. Please load a solution first.");
+            }
+
+            // Find the symbol
+            ISymbol? symbol = null;
+            foreach (var project in solution.Projects)
+            {
+                var compilation = await project.GetCompilationAsync(cts.Token);
+                if (compilation == null) continue;
+
+                symbol = compilation.GetTypeByMetadataName(fullyQualifiedName);
+                if (symbol != null)
+                {
+                    Console.Error.WriteLine($"Found symbol in project: {project.Name}");
+                    break;
+                }
+
+                // Try to find method or property by parsing the name
+                if (fullyQualifiedName.Contains(".") && fullyQualifiedName.Contains("("))
+                {
+                    // Method signature - simplified parsing
+                    var lastDot = fullyQualifiedName.LastIndexOf('.');
+                    if (lastDot > 0)
+                    {
+                        var typeName = fullyQualifiedName.Substring(0, lastDot);
+                        var memberName = fullyQualifiedName.Substring(lastDot + 1);
+                        var parenIndex = memberName.IndexOf('(');
+                        if (parenIndex > 0)
+                        {
+                            memberName = memberName.Substring(0, parenIndex);
+                        }
+
+                        var type = compilation.GetTypeByMetadataName(typeName);
+                        if (type != null)
+                        {
+                            symbol = type.GetMembers(memberName).FirstOrDefault();
+                            if (symbol != null)
+                            {
+                                Console.Error.WriteLine($"Found member symbol in project: {project.Name}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (symbol == null)
+            {
+                return CreateErrorResult($"Symbol not found: {fullyQualifiedName}");
+            }
+
+            // Find references
+            Console.Error.WriteLine($"Finding references for: {symbol.ToDisplayString()}");
+            var references = await SymbolFinder.FindReferencesAsync(symbol, solution, cts.Token);
+
+            // Flatten locations
+            var allLocations = new List<ReferenceLocation>();
+            foreach (var referencedSymbol in references)
+            {
+                foreach (var location in referencedSymbol.Locations)
+                {
+                    var lineSpan = location.Location.GetLineSpan();
+                    allLocations.Add(new ReferenceLocation
+                    {
+                        File = lineSpan.Path,
+                        Line = lineSpan.StartLinePosition.Line + 1, // Convert to 1-based
+                        Column = lineSpan.StartLinePosition.Character + 1,
+                        Text = await GetLocationTextAsync(location.Document, lineSpan, cts.Token)
+                    });
+                }
+            }
+
+            // Sort deterministically
+            allLocations = allLocations
+                .OrderBy(l => l.File)
+                .ThenBy(l => l.Line)
+                .ThenBy(l => l.Column)
+                .ToList();
+
+            Console.Error.WriteLine($"Found {allLocations.Count} references");
+
+            // Apply pagination
+            var skip = (page - 1) * pageSize;
+            var pagedLocations = allLocations.Skip(skip).Take(pageSize).ToList();
+            var hasMore = skip + pageSize < allLocations.Count;
+
+            var result = new Dictionary<string, object>
+            {
+                ["success"] = true,
+                ["total"] = allLocations.Count,
+                ["page"] = page,
+                ["pageSize"] = pageSize,
+                ["references"] = pagedLocations.Select(l => new
+                {
+                    file = l.File,
+                    line = l.Line,
+                    column = l.Column,
+                    text = l.Text
+                }).ToList()
+            };
+
+            if (hasMore)
+            {
+                // Create opaque cursor token
+                var nextOffset = skip + pageSize;
+                var cursorData = new { offset = nextOffset };
+                var cursorJson = JsonSerializer.Serialize(cursorData);
+                var cursorBytes = Encoding.UTF8.GetBytes(cursorJson);
+                result["nextCursor"] = Convert.ToBase64String(cursorBytes);
+            }
+
+            // Return text plus structured content according to MCP
+            var elem = JsonSerializer.SerializeToElement(result);
+            return new ToolCallResult
+            {
+                Content = new List<ToolContent>
+                {
+                    new ToolContent
+                    {
+                        Type = "text",
+                        Text = JsonSerializer.Serialize(result, new JsonSerializerOptions 
+                        { 
+                            WriteIndented = true 
+                        })
+                    }
+                },
+                StructuredContent = elem
+            };
+        }
+        catch (OperationCanceledException)
+        {
+            return CreateErrorResult($"Operation timed out");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"FindReferencesTool error: {ex}");
+            return CreateErrorResult($"Exception: {ex.Message}");
+        }
+    }
+
+    private async Task<string> GetLocationTextAsync(Document? document, FileLinePositionSpan lineSpan, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (document == null) return "";
+            
+            var text = await document.GetTextAsync(cancellationToken);
+            var line = text.Lines[lineSpan.StartLinePosition.Line];
+            return line.ToString().Trim();
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private ToolCallResult CreateErrorResult(string message)
+    {
+        var result = new { success = false, error = message };
+        
+        return new ToolCallResult
+        {
+            IsError = true,
+            Content = new List<ToolContent>
+            {
+                new ToolContent
+                {
+                    Type = "text",
+                    Text = JsonSerializer.Serialize(result)
+                }
+            }
+        };
+    }
+
+    private class ReferenceLocation
+    {
+        public string File { get; set; } = "";
+        public int Line { get; set; }
+        public int Column { get; set; }
+        public string Text { get; set; } = "";
+    }
+}
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.FindSymbols;
+using Microsoft.CodeAnalysis.Text;
+using RoslynMcpServer.Infrastructure;
+using RoslynMcpServer.Roslyn;
+
+namespace RoslynMcpServer.Tools;
+
+public sealed class GetAllImplementationsTool
+{
+    private readonly WorkspaceHost _workspaceHost;
+
+    public GetAllImplementationsTool(WorkspaceHost workspaceHost)
+    {
+        _workspaceHost = workspaceHost ?? throw new ArgumentNullException(nameof(workspaceHost));
+    }
+
+    public async Task<ToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (!arguments.HasValue || arguments.Value.ValueKind == JsonValueKind.Null)
+                return Error("Missing arguments");
+
+            var solution = _workspaceHost.GetSolution();
+            if (solution is null)
+                return Error("No solution loaded. Please load a solution first.");
+
+            var args = arguments.Value;
+            string? fqn = TryGetString(args, "fullyQualifiedName");
+            string? file = TryGetString(args, "file");
+            int line = TryGetInt(args, "line") ?? -1;
+            int column = TryGetInt(args, "column") ?? -1;
+            string? memberName = TryGetString(args, "member");
+
+            bool solutionOnly = TryGetBool(args, "solutionOnly") ?? true;
+            bool includeDerivedInterfaces = TryGetBool(args, "includeDerivedInterfaces") ?? true;
+            int page = Math.Max(1, TryGetInt(args, "page") ?? 1);
+            int pageSize = Math.Clamp(TryGetInt(args, "pageSize") ?? 200, 1, 500);
+            int timeoutMs = Math.Clamp(TryGetInt(args, "timeoutMs") ?? 60000, 1000, 300000);
+
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromMilliseconds(timeoutMs));
+            var ct = cts.Token;
+
+            // Resolve symbol (type or member)
+            var resolved = fqn is not null
+                ? await ResolveByFqnAsync(solution, fqn, ct)
+                : await ResolveByLocationAsync(solution, file, line, column, ct);
+
+            if (resolved is null)
+                return Error($"Could not resolve a symbol (input: {(fqn ?? $"{file}:{line}:{column}")}).");
+
+            INamedTypeSymbol? iface = null;
+            ISymbol? member = null;
+
+            switch (resolved)
+            {
+                case INamedTypeSymbol nt when nt.TypeKind == TypeKind.Interface:
+                    iface = nt;
+                    if (!string.IsNullOrWhiteSpace(memberName))
+                        member = nt.GetMembers().FirstOrDefault(m => string.Equals(m.Name, memberName, StringComparison.Ordinal));
+                    break;
+                case IMethodSymbol ms when ms.ContainingType?.TypeKind == TypeKind.Interface:
+                    iface = ms.ContainingType; member = ms; break;
+                case IPropertySymbol ps when ps.ContainingType?.TypeKind == TypeKind.Interface:
+                    iface = ps.ContainingType; member = ps; break;
+                case IEventSymbol es when es.ContainingType?.TypeKind == TypeKind.Interface:
+                    iface = es.ContainingType; member = es; break;
+                default:
+                    return Error("Target must be an interface type or an interface member.");
+            }
+
+            var ifaceDesc = SymbolFormatting.Describe(iface);
+
+            var derivedInterfaces = new List<object>();
+            if (includeDerivedInterfaces)
+            {
+                var derives = await SymbolFinder.FindDerivedInterfacesAsync(iface, solution, transitive: true, projects: null, ct).ConfigureAwait(false);
+                foreach (var d in derives.OfType<INamedTypeSymbol>())
+                {
+                    if (solutionOnly && !HasSource(d)) continue;
+                    derivedInterfaces.Add(Describe(d));
+                }
+            }
+
+            var implementations = new List<object>();
+            int total;
+            string? nextCursor;
+
+            if (member is null)
+            {
+                var types = await SymbolFinder.FindImplementationsAsync(iface, solution, transitive: true, projects: null, ct).ConfigureAwait(false);
+                var list = types.OfType<INamedTypeSymbol>().Where(t => t.TypeKind is TypeKind.Class or TypeKind.Struct);
+                if (solutionOnly) list = list.Where(HasSource);
+                var all = list.OrderBy(t => t.ToDisplayString()).Select(Describe).ToList();
+                total = all.Count;
+                implementations.AddRange(all.Skip((page - 1) * pageSize).Take(pageSize));
+                nextCursor = (page * pageSize) < total ? $"page={page + 1}" : null;
+            }
+            else
+            {
+                var implMembers = await SymbolFinder.FindImplementationsAsync(member, solution, projects: null, ct).ConfigureAwait(false);
+                var all = implMembers.Where(s => !solutionOnly || HasSource(s)).OrderBy(s => s.ToDisplayString()).Select(Describe).ToList();
+                total = all.Count;
+                implementations.AddRange(all.Skip((page - 1) * pageSize).Take(pageSize));
+                nextCursor = (page * pageSize) < total ? $"page={page + 1}" : null;
+            }
+
+            var result = new
+            {
+                success = true,
+                @interface = new { display = ifaceDesc.Display, file = ifaceDesc.File, line = ifaceDesc.Line, column = ifaceDesc.Column },
+                member = member?.ToDisplayString(),
+                includeDerivedInterfaces,
+                page,
+                pageSize,
+                total,
+                nextCursor,
+                derivedInterfaces,
+                implementations
+            };
+
+            return Ok(result);
+        }
+        catch (OperationCanceledException)
+        {
+            return Error("Operation canceled (timeout or external cancellation).");
+        }
+        catch (Exception ex)
+        {
+            return ErrorObj("Unhandled exception in get_all_implementations", ex);
+        }
+    }
+
+    private static bool HasSource(ISymbol s) => s.Locations.Any(l => l.IsInSource);
+    private static object Describe(ISymbol s) { var d = SymbolFormatting.Describe(s); return new { display = d.Display, file = d.File, line = d.Line, column = d.Column, kind = s.Kind.ToString() }; }
+
+    private static string? TryGetString(JsonElement obj, string name) => obj.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() : null;
+    private static int? TryGetInt(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var e)) return null;
+        return e.ValueKind switch
+        {
+            JsonValueKind.Number => e.TryGetInt32(out var i) ? i : (int?)null,
+            JsonValueKind.String => int.TryParse(e.GetString(), out var j) ? j : (int?)null,
+            _ => null
+        };
+    }
+    private static bool? TryGetBool(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var e)) return null;
+        return e.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String => bool.TryParse(e.GetString(), out var b) ? b : (bool?)null,
+            _ => null
+        };
+    }
+
+    private static ToolCallResult Ok(object structured) => new()
+    {
+        Content = new List<ToolContent> { new ToolContent { Type = "text", Text = JsonSerializer.Serialize(structured, new JsonSerializerOptions { WriteIndented = true }) } },
+        StructuredContent = JsonSerializer.SerializeToElement(structured)
+    };
+    private static ToolCallResult Error(string message) => new()
+    {
+        IsError = true,
+        Content = new List<ToolContent> { new ToolContent { Type = "text", Text = JsonSerializer.Serialize(new { success = false, error = message }) } }
+    };
+    private static ToolCallResult ErrorObj(string error, Exception ex) => new()
+    {
+        IsError = true,
+        Content = new List<ToolContent>
+        {
+            new ToolContent
+            {
+                Type = "text",
+                Text = JsonSerializer.Serialize(new { success = false, error, exception = ex.GetType().FullName, message = ex.Message, stack = ex.StackTrace }, new JsonSerializerOptions { WriteIndented = true })
+            }
+        }
+    };
+
+    private static async Task<ISymbol?> ResolveByFqnAsync(Solution solution, string fqn, CancellationToken ct)
+    {
+        foreach (var project in solution.Projects)
+        {
+            var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
+            if (compilation is null) continue;
+            var type = compilation.GetTypeByMetadataName(fqn);
+            if (type is not null) return type;
+
+            var lastDot = fqn.LastIndexOf('.');
+            if (lastDot > 0)
+            {
+                var typeName = fqn.Substring(0, lastDot);
+                var t2 = compilation.GetTypeByMetadataName(typeName);
+                if (t2 is not null)
+                {
+                    var memName = fqn.Substring(lastDot + 1);
+                    var paren = memName.IndexOf('(');
+                    if (paren >= 0) memName = memName[..paren];
+                    return t2.GetMembers().FirstOrDefault(m => string.Equals(m.Name, memName, StringComparison.Ordinal)) ?? (ISymbol)t2;
+                }
+            }
+        }
+        foreach (var project in solution.Projects)
+        {
+            var decls = await SymbolFinder.FindDeclarationsAsync(project, fqn, ignoreCase: false, ct).ConfigureAwait(false);
+            var best = decls.FirstOrDefault();
+            if (best != null) return best;
+        }
+        return null;
+    }
+
+    private static async Task<ISymbol?> ResolveByLocationAsync(Solution solution, string? file, int line, int column, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(file) || line < 1 || column < 1) return null;
+        var docId = solution.GetDocumentIdsWithFilePath(file).FirstOrDefault();
+        if (docId == null) return null;
+        var document = solution.GetDocument(docId);
+        if (document == null) return null;
+        var text = await document.GetTextAsync(ct).ConfigureAwait(false);
+        var pos = text.Lines.GetPosition(new LinePosition(line - 1, column - 1));
+        var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+        if (model == null) return null;
+        return model.GetEnclosingSymbol(pos, ct) ?? model.GetDeclaredSymbol((await model.SyntaxTree.GetRootAsync(ct).ConfigureAwait(false)).FindToken(pos).Parent, ct);
+    }
+}
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.FindSymbols;
+using Microsoft.CodeAnalysis.Text;
+using RoslynMcpServer.Infrastructure;
+using RoslynMcpServer.Roslyn;
+
+namespace RoslynMcpServer.Tools;
+
+public sealed class GetInheritanceTreeTool
+{
+    private readonly WorkspaceHost _workspaceHost;
+
+    public GetInheritanceTreeTool(WorkspaceHost workspaceHost)
+    {
+        _workspaceHost = workspaceHost ?? throw new ArgumentNullException(nameof(workspaceHost));
+    }
+
+    public async Task<ToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (!arguments.HasValue || arguments.Value.ValueKind == JsonValueKind.Null)
+                return Error("Missing arguments");
+
+            var solution = _workspaceHost.GetSolution();
+            if (solution is null)
+                return Error("No solution loaded. Please load a solution first.");
+
+            var args = arguments.Value;
+            string? fqn = TryGetString(args, "fullyQualifiedName");
+            string? file = TryGetString(args, "file");
+            int line = TryGetInt(args, "line") ?? -1;
+            int column = TryGetInt(args, "column") ?? -1;
+            string direction = TryGetString(args, "direction")?.ToLowerInvariant() ?? "both"; // both|ancestors|descendants
+            bool includeInterfaces = TryGetBool(args, "includeInterfaces") ?? true;
+            bool includeOverrides = TryGetBool(args, "includeOverrides") ?? false;
+            int maxDepth = Math.Clamp(TryGetInt(args, "maxDepth") ?? 10, 1, 100);
+            bool solutionOnly = TryGetBool(args, "solutionOnly") ?? true;
+            int page = Math.Max(1, TryGetInt(args, "page") ?? 1);
+            int pageSize = Math.Clamp(TryGetInt(args, "pageSize") ?? 200, 1, 500);
+            int timeoutMs = Math.Clamp(TryGetInt(args, "timeoutMs") ?? 60000, 1000, 300000);
+
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromMilliseconds(timeoutMs));
+            var ct = cts.Token;
+
+            // Resolve target type symbol
+            var type = fqn is not null
+                ? await ResolveTypeByFqnAsync(solution, fqn, ct)
+                : await ResolveTypeByLocationAsync(solution, file, line, column, ct);
+
+            if (type is null)
+                return Error($"Could not resolve a type (input: {(fqn ?? $"{file}:{line}:{column}")}).");
+
+            var rootDesc = SymbolFormatting.Describe(type);
+
+            // Ancestors
+            var ancestors = new List<object>();
+            if (direction is "both" or "ancestors")
+            {
+                for (var t = type.BaseType; t != null; t = t.BaseType)
+                {
+                    if (solutionOnly && !HasSource(t)) continue;
+                    ancestors.Add(Describe(t));
+                }
+            }
+
+            // Interfaces
+            var interfaces = new List<object>();
+            if (includeInterfaces)
+            {
+                foreach (var itf in type.AllInterfaces)
+                {
+                    if (solutionOnly && !HasSource(itf)) continue;
+                    interfaces.Add(Describe(itf));
+                }
+            }
+
+            // Descendants
+            var descendantsFlat = new List<object>();
+            object? descendantsTree = null;
+            if (direction is "both" or "descendants")
+            {
+                var (flat, tree) = await BuildDescendantsAsync(solution, type, maxDepth, solutionOnly, ct);
+                descendantsFlat = flat;
+                descendantsTree = tree;
+            }
+
+            // Overrides per member (optional)
+            var overrides = new List<object>();
+            if (includeOverrides && type.TypeKind is TypeKind.Class or TypeKind.Struct)
+            {
+                var members = type.GetMembers().Where(m => m.IsVirtual || m.IsAbstract || m.IsOverride);
+                foreach (var mem in members)
+                {
+                    var impls = await SymbolFinder.FindOverridesAsync(mem, solution, projects: null, ct).ConfigureAwait(false);
+                    var implDescs = new List<object>();
+                    foreach (var s in impls)
+                    {
+                        if (solutionOnly && !HasSource(s)) continue;
+                        implDescs.Add(Describe(s));
+                    }
+                    overrides.Add(new { member = mem.ToDisplayString(), count = implDescs.Count, implementations = implDescs });
+                }
+            }
+
+            // Paging for descendantsFlat
+            var total = descendantsFlat.Count;
+            var paged = descendantsFlat.Skip((page - 1) * pageSize).Take(pageSize).ToArray();
+            string? nextCursor = (page * pageSize) < total ? $"page={page + 1}" : null;
+
+            var result = new
+            {
+                success = true,
+                root = new
+                {
+                    display = rootDesc.Display,
+                    file = rootDesc.File,
+                    line = rootDesc.Line,
+                    column = rootDesc.Column,
+                    kind = type.TypeKind.ToString(),
+                    containingNamespace = type.ContainingNamespace?.ToDisplayString()
+                },
+                direction,
+                includeInterfaces,
+                includeOverrides,
+                maxDepth,
+                ancestors,
+                interfaces,
+                descendantsTree,
+                page,
+                pageSize,
+                total,
+                nextCursor,
+                descendantsFlat = paged,
+                overrides
+            };
+
+            return Ok(result);
+        }
+        catch (OperationCanceledException)
+        {
+            return Error("Operation canceled (timeout or external cancellation).");
+        }
+        catch (Exception ex)
+        {
+            return ErrorObj("Unhandled exception in get_inheritance_tree", ex);
+        }
+    }
+
+    private async Task<(List<object> flat, object tree)> BuildDescendantsAsync(
+        Solution solution,
+        INamedTypeSymbol root,
+        int maxDepth,
+        bool solutionOnly,
+        CancellationToken ct)
+    {
+        var flatList = new List<INamedTypeSymbol>();
+
+        if (root.TypeKind == TypeKind.Interface)
+        {
+            var derivedItf = await SymbolFinder.FindDerivedInterfacesAsync(root, solution, transitive: true, projects: null, ct).ConfigureAwait(false);
+            foreach (var d in derivedItf.OfType<INamedTypeSymbol>()) flatList.Add(d);
+        }
+        else
+        {
+            var derived = await SymbolFinder.FindDerivedClassesAsync(root, solution, transitive: true, projects: null, ct).ConfigureAwait(false);
+            foreach (var d in derived) flatList.Add(d);
+        }
+
+        if (solutionOnly)
+            flatList = flatList.Where(HasSource).ToList();
+
+        // Build parent->children map
+        var children = new Dictionary<INamedTypeSymbol, List<INamedTypeSymbol>>(SymbolEqualityComparer.Default);
+        if (root.TypeKind == TypeKind.Interface)
+        {
+            foreach (var t in flatList)
+            {
+                foreach (var p in t.Interfaces)
+                {
+                    if (SymbolEqualityComparer.Default.Equals(p, root) || flatList.Contains(p, SymbolEqualityComparer.Default))
+                    {
+                        if (!children.TryGetValue(p, out var list)) children[p] = list = new();
+                        list.Add(t);
+                    }
+                }
+            }
+        }
+        else
+        {
+            foreach (var t in flatList)
+            {
+                var p = t.BaseType;
+                if (p is null) continue;
+                if (SymbolEqualityComparer.Default.Equals(p, root) || flatList.Contains(p, SymbolEqualityComparer.Default))
+                {
+                    if (!children.TryGetValue(p, out var list)) children[p] = list = new();
+                    list.Add(t);
+                }
+            }
+        }
+
+        object ToNode(INamedTypeSymbol node, int depth)
+        {
+            var d = SymbolFormatting.Describe(node);
+            var kids = children.TryGetValue(node, out var ch) ? ch : new List<INamedTypeSymbol>();
+            var nested = (depth < maxDepth)
+                ? kids.OrderBy(t => t.Name).Select(t => ToNode(t, depth + 1)).ToArray()
+                : Array.Empty<object>();
+
+            return new { display = d.Display, file = d.File, line = d.Line, column = d.Column, kind = node.TypeKind.ToString(), children = nested };
+        }
+
+        var tree = ToNode(root, 1);
+        var flatOut = flatList.OrderBy(t => t.ToDisplayString()).Select(Describe).ToList();
+        return (flatOut, tree);
+    }
+
+    private static bool HasSource(ISymbol s) => s.Locations.Any(l => l.IsInSource);
+
+    private static object Describe(ISymbol s)
+    {
+        var d = SymbolFormatting.Describe(s);
+        return new { display = d.Display, file = d.File, line = d.Line, column = d.Column, kind = s.Kind.ToString() };
+    }
+
+    private static string? TryGetString(JsonElement obj, string name)
+        => obj.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() : null;
+
+    private static int? TryGetInt(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var e)) return null;
+        return e.ValueKind switch
+        {
+            JsonValueKind.Number => e.TryGetInt32(out var i) ? i : (int?)null,
+            JsonValueKind.String => int.TryParse(e.GetString(), out var j) ? j : (int?)null,
+            _ => null
+        };
+    }
+
+    private static bool? TryGetBool(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var e)) return null;
+        return e.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String => bool.TryParse(e.GetString(), out var b) ? b : (bool?)null,
+            _ => null
+        };
+    }
+
+    private static ToolCallResult Ok(object structured)
+        => new()
+        {
+            Content = new List<ToolContent>
+            {
+                new ToolContent { Type = "text", Text = JsonSerializer.Serialize(structured, new JsonSerializerOptions { WriteIndented = true }) }
+            },
+            StructuredContent = JsonSerializer.SerializeToElement(structured)
+        };
+
+    private static ToolCallResult Error(string message)
+        => new()
+        {
+            IsError = true,
+            Content = new List<ToolContent> { new ToolContent { Type = "text", Text = JsonSerializer.Serialize(new { success = false, error = message }) } }
+        };
+
+    private static ToolCallResult ErrorObj(string error, Exception ex)
+        => new()
+        {
+            IsError = true,
+            Content = new List<ToolContent>
+            {
+                new ToolContent
+                {
+                    Type = "text",
+                    Text = JsonSerializer.Serialize(new { success = false, error, exception = ex.GetType().FullName, message = ex.Message, stack = ex.StackTrace }, new JsonSerializerOptions { WriteIndented = true })
+                }
+            }
+        };
+
+    private static async Task<INamedTypeSymbol?> ResolveTypeByFqnAsync(Solution solution, string fqn, CancellationToken ct)
+    {
+        foreach (var project in solution.Projects)
+        {
+            var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
+            if (compilation is null) continue;
+            var type = compilation.GetTypeByMetadataName(fqn);
+            if (type is INamedTypeSymbol nt) return nt;
+
+            var lastDot = fqn.LastIndexOf('.');
+            if (lastDot > 0)
+            {
+                var typeName = fqn.Substring(0, lastDot);
+                var t2 = compilation.GetTypeByMetadataName(typeName);
+                if (t2 is INamedTypeSymbol nt2) return nt2;
+            }
+        }
+        foreach (var project in solution.Projects)
+        {
+            var decls = await SymbolFinder.FindDeclarationsAsync(project, fqn, ignoreCase: false, ct).ConfigureAwait(false);
+            var firstType = decls.OfType<INamedTypeSymbol>().FirstOrDefault();
+            if (firstType != null) return firstType;
+        }
+        return null;
+    }
+
+    private static async Task<INamedTypeSymbol?> ResolveTypeByLocationAsync(Solution solution, string? file, int line, int column, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(file) || line < 1 || column < 1) return null;
+        var docId = solution.GetDocumentIdsWithFilePath(file).FirstOrDefault();
+        if (docId == null) return null;
+        var document = solution.GetDocument(docId);
+        if (document == null) return null;
+        var text = await document.GetTextAsync(ct).ConfigureAwait(false);
+        var pos = text.Lines.GetPosition(new LinePosition(line - 1, column - 1));
+        var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+        if (model == null) return null;
+        var sym = model.GetEnclosingSymbol(pos, ct) ?? model.GetDeclaredSymbol((await model.SyntaxTree.GetRootAsync(ct).ConfigureAwait(false)).FindToken(pos).Parent, ct);
+        return (sym as INamedTypeSymbol) ?? sym?.ContainingType;
+    }
+}
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.FindSymbols;
+using Microsoft.CodeAnalysis.Operations;
+using Microsoft.CodeAnalysis.Text;
+using RoslynMcpServer.Infrastructure;
+using RoslynMcpServer.Roslyn;
+
+namespace RoslynMcpServer.Tools;
+
+public sealed class GetMethodDependenciesTool
+{
+    private readonly WorkspaceHost _workspaceHost;
+
+    public GetMethodDependenciesTool(WorkspaceHost workspaceHost)
+    {
+        _workspaceHost = workspaceHost ?? throw new ArgumentNullException(nameof(workspaceHost));
+    }
+
+    /// <summary>
+    /// Execute the tool.
+    /// Arguments JSON supports either:
+    ///  - { "fullyQualifiedName": "My.Namespace.Type.Member(params)" }
+    /// or
+    ///  - { "file": "/abs/path.cs", "line": 42, "column": 17 }
+    ///
+    /// Optional flags:
+    ///  - depth (int, default: 1) -> depth==1 = bezpośrednie zależności; >1 = tranzytywne (DFS/BFS)
+    ///  - includeCallers (bool, default: false)
+    ///  - treatPropertiesAsMethods (bool, default: true) => raportuj get_/set_ jako calls
+    ///  - page/pageSize (int) -> proste stronicowanie wyniku "calls" (największa część); reads/writes zwracane w całości
+    ///  - timeoutMs (int, default: 60000)
+    /// </summary>
+    public async Task<ToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (!arguments.HasValue || arguments.Value.ValueKind == JsonValueKind.Null)
+                return CreateErrorResult("Missing arguments");
+
+            var solution = _workspaceHost.GetSolution();
+            if (solution is null)
+                return CreateErrorResult("No solution loaded. Please load a solution first.");
+
+            // Parse args
+            string? fqn = TryGetString(arguments.Value, "fullyQualifiedName");
+            string? file = TryGetString(arguments.Value, "file");
+            int line = TryGetInt(arguments.Value, "line") ?? -1;
+            int column = TryGetInt(arguments.Value, "column") ?? -1;
+
+            int depth = Math.Max(1, TryGetInt(arguments.Value, "depth") ?? 1);
+            bool includeCallers = TryGetBool(arguments.Value, "includeCallers") ?? false;
+            bool treatPropertiesAsMethods = TryGetBool(arguments.Value, "treatPropertiesAsMethods") ?? true;
+
+            int page = Math.Max(1, TryGetInt(arguments.Value, "page") ?? 1);
+            int pageSize = Math.Clamp(TryGetInt(arguments.Value, "pageSize") ?? 200, 1, 500);
+            int timeoutMs = Math.Clamp(TryGetInt(arguments.Value, "timeoutMs") ?? 60000, 1000, 300000);
+
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromMilliseconds(timeoutMs));
+            var ct = cts.Token;
+
+            // Resolve target method symbol
+            var resolved = fqn is not null
+                ? await ResolveByFqnAsync(solution, fqn, ct)
+                : await ResolveByLocationAsync(solution, file, line, column, ct);
+
+            if (resolved.Symbol is null || resolved.Document is null)
+                return CreateErrorResult($"Could not resolve a method symbol (input: {(fqn ?? $"{file}:{line}:{column}")}).");
+
+            var rootMethod = resolved.Symbol;
+
+            // Traverse dependencies (direct or transitive)
+            var visited = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+            var callSet = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default);
+            var readSet = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+            var writeSet = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+
+            // BFS over call graph up to "depth"
+            var queue = new Queue<(IMethodSymbol method, int level)>();
+            queue.Enqueue((rootMethod, 1));
+            visited.Add(rootMethod);
+
+            while (queue.Count > 0)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var (currentMethod, level) = queue.Dequeue();
+
+                // Analyze a single method body using IOperation
+                await AnalyzeMethodBodyAsync(currentMethod, callSet, readSet, writeSet, treatPropertiesAsMethods, ct);
+
+                if (level < depth)
+                {
+                    // Enqueue next level: direct calls from currentMethod
+                    foreach (var callee in callSet.Where(m => !visited.Contains(m)))
+                    {
+                        visited.Add(callee);
+                        queue.Enqueue((callee, level + 1));
+                    }
+                }
+            }
+
+            // Prepare "callers" (optional, only for the root symbol)
+            var callersList = new List<object>();
+            if (includeCallers)
+            {
+                var callers = await SymbolFinder.FindCallersAsync(rootMethod, solution, ct);
+                foreach (var c in callers)
+                {
+                    // Try to pick a source location if available
+                    var loc = c.CallingSymbol != null ? c.CallingSymbol.Locations.FirstOrDefault(l => l.IsInSource) : null;
+                    var desc = c.CallingSymbol is null ? null : SymbolFormatting.Describe(c.CallingSymbol);
+                    callersList.Add(new
+                    {
+                        display = desc?.Display ?? c.CallingSymbol?.ToDisplayString() ?? "<unknown>",
+                        file = desc?.File,
+                        line = desc?.Line,
+                        column = desc?.Column,
+                        isDirect = c.IsDirect,
+                        callSites = c.Locations.Select(l => new
+                        {
+                            file = TryGetFilePath(l),
+                            line = TryGetLine(l),
+                            column = TryGetColumn(l)
+                        })
+                    });
+                }
+            }
+
+            // Turn symbols → presentation objects
+            var callsArray = callSet
+                .Select(s => SymbolFormatting.Describe(s))
+                .ToArray();
+
+            var readsArray = readSet
+                .Select(s => SymbolFormatting.Describe(s))
+                .ToArray();
+
+            var writesArray = writeSet
+                .Select(s => SymbolFormatting.Describe(s))
+                .ToArray();
+
+            var targetDesc = SymbolFormatting.Describe(rootMethod);
+
+            // Simple paging for "calls" (often the largest)
+            var totalCalls = callsArray.Length;
+            var callsPaged = callsArray
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToArray();
+
+            string? nextCursor = null;
+            if ((page * pageSize) < totalCalls)
+                nextCursor = $"page={page + 1}";
+
+            var result = new
+            {
+                success = true,
+                symbol = new
+                {
+                    display = targetDesc.Display,
+                    file = targetDesc.File,
+                    line = targetDesc.Line,
+                    column = targetDesc.Column,
+                    kind = rootMethod.Kind.ToString(),
+                    containingType = rootMethod.ContainingType?.ToDisplayString(),
+                    containingNamespace = rootMethod.ContainingNamespace?.ToDisplayString()
+                },
+                depth,
+                page,
+                pageSize,
+                totalCalls,
+                nextCursor,
+                calls = callsPaged.Select(d => new
+                {
+                    display = d.Display,
+                    file = d.File,
+                    line = d.Line,
+                    column = d.Column
+                }),
+                reads = readsArray.Select(d => new
+                {
+                    display = d.Display,
+                    file = d.File,
+                    line = d.Line,
+                    column = d.Column
+                }),
+                writes = writesArray.Select(d => new
+                {
+                    display = d.Display,
+                    file = d.File,
+                    line = d.Line,
+                    column = d.Column
+                }),
+                callers = callersList
+            };
+
+            var elem = JsonSerializer.SerializeToElement(result);
+            return new ToolCallResult
+            {
+                Content = new List<ToolContent>
+                {
+                    new ToolContent
+                    {
+                        Type = "text",
+                        Text = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true })
+                    }
+                },
+                StructuredContent = elem
+            };
+        }
+        catch (OperationCanceledException)
+        {
+            return CreateErrorResult("Operation canceled (timeout or external cancellation).");
+        }
+        catch (Exception ex)
+        {
+            var err = new
+            {
+                success = false,
+                error = "Unhandled exception in get_method_dependencies",
+                exception = ex.GetType().FullName,
+                message = ex.Message,
+                stack = ex.StackTrace
+            };
+
+            return new ToolCallResult
+            {
+                IsError = true,
+                Content = new List<ToolContent>
+                {
+                    new ToolContent
+                    {
+                        Type = "text",
+                        Text = JsonSerializer.Serialize(err, new JsonSerializerOptions { WriteIndented = true })
+                    }
+                },
+                StructuredContent = err
+            };
+        }
+    }
+
+    #region Core analysis
+
+    private async Task AnalyzeMethodBodyAsync(
+        IMethodSymbol method,
+        HashSet<IMethodSymbol> calls,
+        HashSet<ISymbol> reads,
+        HashSet<ISymbol> writes,
+        bool treatPropertiesAsMethods,
+        CancellationToken ct)
+    {
+        // Prefer first source declaration
+        var syntaxRef = method.DeclaringSyntaxReferences.FirstOrDefault();
+        if (syntaxRef is null)
+            return; // metadata-only or external
+
+        var syntax = await syntaxRef.GetSyntaxAsync(ct);
+        var doc = method.DeclaringSyntaxReferences
+            .Select(r => r.SyntaxTree)
+            .Select(tree => FindDocumentByTree(tree))
+            .FirstOrDefault(d => d != null);
+
+        // Fallback: get Document by SyntaxTree from any project in solution
+        Document? document = doc ?? FindDocumentByTree(syntax.SyntaxTree);
+        if (document is null)
+            return;
+
+        var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+        if (model is null)
+            return;
+
+        // Body or expression-body
+        var bodyNode =
+            syntax.ChildNodes().FirstOrDefault(n => n.RawKind == (int)Microsoft.CodeAnalysis.CSharp.SyntaxKind.Block) ??
+            syntax.ChildNodes().FirstOrDefault(n => n.RawKind == (int)Microsoft.CodeAnalysis.CSharp.SyntaxKind.ArrowExpressionClause) ??
+            syntax;
+
+        var op = model.GetOperation(bodyNode, ct);
+        if (op is null)
+            return;
+
+        // Walk IOperation tree
+        var walker = new OperationWalker(treatPropertiesAsMethods);
+        walker.Walk(op);
+
+        foreach (var m in walker.Calls)
+            calls.Add(m);
+
+        foreach (var r in walker.Reads)
+            reads.Add(r);
+
+        foreach (var w in walker.Writes)
+            writes.Add(w);
+    }
+
+    private sealed class OperationWalker
+    {
+        private readonly bool _propsAsMethods;
+
+        public HashSet<IMethodSymbol> Calls { get; } = new(SymbolEqualityComparer.Default);
+        public HashSet<ISymbol> Reads { get; } = new(SymbolEqualityComparer.Default);
+        public HashSet<ISymbol> Writes { get; } = new(SymbolEqualityComparer.Default);
+
+        public OperationWalker(bool propsAsMethods)
+        {
+            _propsAsMethods = propsAsMethods;
+        }
+
+        public void Walk(IOperation root)
+        {
+            Visit(root, writeContext: false);
+        }
+
+        private void Visit(IOperation? node, bool writeContext)
+        {
+            if (node is null) return;
+
+            switch (node)
+            {
+                case IInvocationOperation inv:
+                    var target = inv.TargetMethod?.ReducedFrom ?? inv.TargetMethod;
+                    if (target != null)
+                        Calls.Add(target);
+                    break;
+
+                case IObjectCreationOperation ctor:
+                    if (ctor.Constructor != null)
+                        Calls.Add(ctor.Constructor);
+                    break;
+
+                case IPropertyReferenceOperation propRef:
+                    if (writeContext)
+                    {
+                        Writes.Add(propRef.Property);
+                        if (_propsAsMethods && propRef.Property?.SetMethod != null)
+                            Calls.Add(propRef.Property.SetMethod);
+                    }
+                    else
+                    {
+                        Reads.Add(propRef.Property);
+                        if (_propsAsMethods && propRef.Property?.GetMethod != null)
+                            Calls.Add(propRef.Property.GetMethod);
+                    }
+                    break;
+
+                case IFieldReferenceOperation fieldRef:
+                    if (writeContext) Writes.Add(fieldRef.Field);
+                    else Reads.Add(fieldRef.Field);
+                    break;
+
+                case IEventReferenceOperation evtRef:
+                    // Treat event add/remove as writes to event symbol (and optionally as synthetic calls)
+                    if (writeContext) Writes.Add(evtRef.Event);
+                    else Reads.Add(evtRef.Event);
+                    break;
+
+                case ICompoundAssignmentOperation compound:
+                    // Both read and write of the target (like x += y)
+                    MarkReadWrite(compound.Target);
+                    Visit(compound.Value, writeContext: false);
+                    return;
+
+                case IAssignmentOperation assign:
+                    // Left in write context, right in read context
+                    Visit(assign.Target, writeContext: true);
+                    Visit(assign.Value, writeContext: false);
+                    return; // children visited with explicit contexts
+
+                case IIncrementOrDecrementOperation incdec:
+                    // ++x / x++ : both read & write
+                    MarkReadWrite(incdec.Target);
+                    return;
+
+                case IArgumentOperation arg:
+                    // ref/out implies write into referenced location; in and default = read
+                    var isWrite = arg.Parameter?.RefKind is RefKind.Ref or RefKind.Out;
+                    Visit(arg.Value, writeContext: isWrite);
+                    return;
+
+                default:
+                    break;
+            }
+
+            foreach (var child in node.ChildOperations)
+                Visit(child, writeContext);
+        }
+
+        private void MarkReadWrite(IOperation target)
+        {
+            switch (target)
+            {
+                case IPropertyReferenceOperation pr:
+                    Reads.Add(pr.Property);
+                    Writes.Add(pr.Property);
+                    if (_propsAsMethods)
+                    {
+                        if (pr.Property?.GetMethod is { } gm) Calls.Add(gm);
+                        if (pr.Property?.SetMethod is { } sm) Calls.Add(sm);
+                    }
+                    break;
+
+                case IFieldReferenceOperation fr:
+                    Reads.Add(fr.Field);
+                    Writes.Add(fr.Field);
+                    break;
+
+                default:
+                    Visit(target, writeContext: false);
+                    Visit(target, writeContext: true);
+                    break;
+            }
+        }
+    }
+
+    #endregion
+
+    #region Symbol resolution helpers
+
+    private sealed record Resolved(IMethodSymbol? Symbol, Document? Document);
+
+    private async Task<Resolved> ResolveByFqnAsync(Solution solution, string fqn, CancellationToken ct)
+    {
+        // Try exact type match first
+        foreach (var project in solution.Projects)
+        {
+            var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
+            if (compilation is null) continue;
+
+            // 1) Exact type
+            var type = compilation.GetTypeByMetadataName(fqn);
+            if (type is IMethodSymbol m1) return new Resolved(m1, await FindDocumentForSymbolAsync(solution, m1, ct));
+            if (type != null)
+            {
+                // If FQN is a type, choose .ctor? Probably user meant a method — fall through.
+            }
+
+            // 2) Split "Type.Member" (with optional params)
+            var lastDot = fqn.LastIndexOf('.');
+            if (lastDot > 0)
+            {
+                var typeName = fqn.Substring(0, lastDot);
+                var memberName = fqn.Substring(lastDot + 1);
+
+                // Strip parameter list if present
+                var paren = memberName.IndexOf('(');
+                if (paren >= 0) memberName = memberName.Substring(0, paren);
+
+                var t = compilation.GetTypeByMetadataName(typeName);
+                if (t != null)
+                {
+                    // Methods
+                    var methods = t.GetMembers()
+                        .OfType<IMethodSymbol>()
+                        .Where(m => string.Equals(m.Name, memberName, StringComparison.Ordinal))
+                        .ToArray();
+
+                    if (methods.Length > 0)
+                        return new Resolved(methods[0], await FindDocumentForSymbolAsync(solution, methods[0], ct));
+
+                    // Properties (map to get_ / set_ as the "method symbol" for analysis)
+                    var prop = t.GetMembers()
+                        .OfType<IPropertySymbol>()
+                        .FirstOrDefault(p => string.Equals(p.Name, memberName, StringComparison.Ordinal));
+
+                    if (prop?.GetMethod is not null)
+                        return new Resolved(prop.GetMethod, await FindDocumentForSymbolAsync(solution, prop.GetMethod, ct));
+                    if (prop?.SetMethod is not null)
+                        return new Resolved(prop.SetMethod, await FindDocumentForSymbolAsync(solution, prop.SetMethod, ct));
+                }
+            }
+        }
+
+        // 3) Best-effort: search by simple name across projects
+        foreach (var project in solution.Projects)
+        {
+            var decls = await SymbolFinder.FindDeclarationsAsync(project, fqn, ignoreCase: false, ct).ConfigureAwait(false);
+            var firstMethod = decls.OfType<IMethodSymbol>().FirstOrDefault();
+            if (firstMethod != null)
+                return new Resolved(firstMethod, await FindDocumentForSymbolAsync(solution, firstMethod, ct));
+        }
+
+        return new Resolved(null, null);
+    }
+
+    private async Task<Resolved> ResolveByLocationAsync(Solution solution, string? file, int line, int column, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(file) || line < 1 || column < 1)
+            return new Resolved(null, null);
+
+        var docId = solution.GetDocumentIdsWithFilePath(file).FirstOrDefault();
+        if (docId == null)
+            return new Resolved(null, null);
+
+        var document = solution.GetDocument(docId);
+        if (document == null)
+            return new Resolved(null, null);
+
+        var text = await document.GetTextAsync(ct).ConfigureAwait(false);
+        var pos = text.Lines.GetPosition(new LinePosition(line - 1, column - 1));
+        var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+        if (model == null)
+            return new Resolved(null, null);
+
+        var root = await model.SyntaxTree.GetRootAsync(ct).ConfigureAwait(false);
+        var node = root.FindToken(pos).Parent;
+
+        // Retrieve enclosing method symbol
+        var symbol = model.GetEnclosingSymbol(pos, ct) as IMethodSymbol;
+        if (symbol != null)
+            return new Resolved(symbol, document);
+
+        // Fallback: try declared symbol at the current node
+        var declared = model.GetDeclaredSymbol(node, ct) as IMethodSymbol;
+        return new Resolved(declared, document);
+    }
+
+    private static async Task<Document?> FindDocumentForSymbolAsync(Solution solution, ISymbol symbol, CancellationToken ct)
+    {
+        var loc = symbol.Locations.FirstOrDefault(l => l.IsInSource);
+        if (loc?.SourceTree == null) return null;
+        var docId = solution.GetDocumentId(loc.SourceTree);
+        if (docId == null) return null;
+        return solution.GetDocument(docId);
+    }
+
+    private Document? FindDocumentByTree(SyntaxTree tree)
+    {
+        var solution = _workspaceHost.GetSolution();
+        if (solution == null) return null;
+        var id = solution.GetDocumentId(tree);
+        return id != null ? solution.GetDocument(id) : null;
+    }
+
+    #endregion
+
+    #region JSON helpers & formatting
+
+    private static string? TryGetString(JsonElement obj, string name)
+        => obj.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() : null;
+
+    private static int? TryGetInt(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var e)) return null;
+        return e.ValueKind switch
+        {
+            JsonValueKind.Number => e.TryGetInt32(out var i) ? i : (int?)null,
+            JsonValueKind.String => int.TryParse(e.GetString(), out var j) ? j : (int?)null,
+            _ => null
+        };
+    }
+
+    private static bool? TryGetBool(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var e)) return null;
+        return e.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String => bool.TryParse(e.GetString(), out var b) ? b : (bool?)null,
+            _ => null
+        };
+    }
+
+    private static string? TryGetFilePath(Location? loc)
+        => loc is { IsInSource: true } ? loc.SourceTree?.FilePath : null;
+
+    private static int? TryGetLine(Location? loc)
+    {
+        if (loc is null || !loc.IsInSource) return null;
+        var span = loc.GetLineSpan();
+        return span.StartLinePosition.Line + 1;
+    }
+
+    private static int? TryGetColumn(Location? loc)
+    {
+        if (loc is null || !loc.IsInSource) return null;
+        var span = loc.GetLineSpan();
+        return span.StartLinePosition.Character + 1;
+    }
+
+    private ToolCallResult CreateErrorResult(string message)
+    {
+        var result = new { success = false, error = message };
+
+        return new ToolCallResult
+        {
+            IsError = true,
+            Content = new List<ToolContent>
+            {
+                new ToolContent
+                {
+                    Type = "text",
+                    Text = JsonSerializer.Serialize(result)
+                }
+            }
+        };
+    }
+
+    #endregion
+}
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using RoslynMcpServer.Infrastructure;
+using RoslynMcpServer.Roslyn;
+
+namespace RoslynMcpServer.Tools;
+
+public class GetTypeInfoTool
+{
+    private readonly WorkspaceHost _workspaceHost;
+
+    public GetTypeInfoTool(WorkspaceHost workspaceHost)
+    {
+        _workspaceHost = workspaceHost ?? throw new ArgumentNullException(nameof(workspaceHost));
+    }
+
+    public async Task<ToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            // Parse arguments
+            if (!arguments.HasValue || arguments.Value.ValueKind == JsonValueKind.Null)
+            {
+                return CreateErrorResult("Missing arguments");
+            }
+
+            if (!arguments.Value.TryGetProperty("fullyQualifiedName", out var fqnElement))
+            {
+                return CreateErrorResult("Missing 'fullyQualifiedName' argument");
+            }
+
+            var fullyQualifiedName = fqnElement.GetString();
+            if (string.IsNullOrEmpty(fullyQualifiedName))
+            {
+                return CreateErrorResult("fullyQualifiedName cannot be empty");
+            }
+
+            // Parse pagination parameters
+            int page = 1;
+            int pageSize = 200;
+
+            if (arguments.Value.TryGetProperty("page", out var pageElement) && pageElement.ValueKind == JsonValueKind.Number)
+            {
+                page = Math.Max(1, pageElement.GetInt32());
+            }
+
+            if (arguments.Value.TryGetProperty("pageSize", out var pageSizeElement) && pageSizeElement.ValueKind == JsonValueKind.Number)
+            {
+                pageSize = Math.Min(500, Math.Max(1, pageSizeElement.GetInt32()));
+            }
+
+            Console.Error.WriteLine($"GetTypeInfo: FQN={fullyQualifiedName}, page={page}, pageSize={pageSize}");
+
+            // Get current solution
+            var solution = _workspaceHost.GetSolution();
+            if (solution == null)
+            {
+                return CreateErrorResult("No solution loaded. Please load a solution first.");
+            }
+
+            // Search for the type across all projects
+            INamedTypeSymbol? typeSymbol = null;
+            foreach (var project in solution.Projects)
+            {
+                var compilation = await project.GetCompilationAsync(cancellationToken);
+                if (compilation == null) continue;
+
+                typeSymbol = compilation.GetTypeByMetadataName(fullyQualifiedName);
+                if (typeSymbol != null)
+                {
+                    Console.Error.WriteLine($"Found type in project: {project.Name}");
+                    break;
+                }
+            }
+
+            if (typeSymbol == null)
+            {
+                return new ToolCallResult
+                {
+                    Content = new List<ToolContent>
+                    {
+                        new ToolContent
+                        {
+                            Type = "text",
+                            Text = JsonSerializer.Serialize(new 
+                            { 
+                                success = false,
+                                error = $"Type not found: {fullyQualifiedName}"
+                            })
+                        }
+                    }
+                };
+            }
+
+            // Get symbol description
+            var symbolDescription = SymbolFormatting.Describe(typeSymbol);
+            var symbolInfo = new
+            {
+                display = symbolDescription.Display,
+                file = symbolDescription.File,
+                line = symbolDescription.Line,
+                column = symbolDescription.Column
+            };
+
+            // Get all members
+            var allMembers = typeSymbol.GetMembers()
+                .Where(m => m.Kind != SymbolKind.NamedType) // Exclude nested types for simplicity
+                .Select(m => new
+                {
+                    Name = m.Name,
+                    Kind = m.Kind.ToString(),
+                    Accessibility = m.DeclaredAccessibility.ToString(),
+                    IsStatic = m.IsStatic,
+                    Type = GetMemberType(m),
+                    Parameters = GetParameters(m)
+                })
+                .ToList();
+
+            // Apply pagination
+            var skip = (page - 1) * pageSize;
+            var pagedMembers = allMembers.Skip(skip).Take(pageSize).ToList();
+            var hasMore = skip + pageSize < allMembers.Count;
+
+            var result = new Dictionary<string, object>
+            {
+                ["success"] = true,
+                ["symbol"] = symbolInfo,
+                ["totalMembers"] = allMembers.Count,
+                ["page"] = page,
+                ["pageSize"] = pageSize,
+                ["members"] = pagedMembers
+            };
+
+            if (hasMore)
+            {
+                result["nextCursor"] = $"page={page + 1}";
+            }
+
+            var jsonText = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+            var elem = JsonSerializer.SerializeToElement(result);
+
+            return new ToolCallResult
+            {
+                Content = new List<ToolContent>
+                {
+                    new ToolContent
+                    {
+                        Type = "text",
+                        Text = jsonText
+                    }
+                },
+                StructuredContent = elem
+            };
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"GetTypeInfoTool error: {ex}");
+            return CreateErrorResult($"Exception: {ex.Message}");
+        }
+    }
+
+    private string? GetMemberType(ISymbol member)
+    {
+        try
+        {
+            return member switch
+            {
+                IFieldSymbol field => field.Type?.ToDisplayString(),
+                IPropertySymbol property => property.Type?.ToDisplayString(),
+                IMethodSymbol method => method.ReturnType?.ToDisplayString(),
+                IEventSymbol evt => evt.Type?.ToDisplayString(),
+                _ => null
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string? GetParameters(ISymbol member)
+    {
+        try
+        {
+            if (member is IMethodSymbol method)
+            {
+                var parameters = method.Parameters.Select(p => 
+                    $"{p.Type.ToDisplayString()} {p.Name}");
+                return $"({string.Join(", ", parameters)})";
+            }
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private ToolCallResult CreateErrorResult(string message)
+    {
+        return new ToolCallResult
+        {
+            IsError = true,
+            Content = new List<ToolContent>
+            {
+                new ToolContent
+                {
+                    Type = "text",
+                    Text = JsonSerializer.Serialize(new 
+                    { 
+                        success = false, 
+                        error = message 
+                    })
+                }
+            }
+        };
+    }
+}
+using System;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.FindSymbols;
+using RoslynMcpServer.Infrastructure;
+using RoslynMcpServer.Roslyn;
+
+namespace RoslynMcpServer.Tools;
+
+public class GotoDefinitionTool
+{
+    private readonly WorkspaceHost _workspaceHost;
+
+    public GotoDefinitionTool(WorkspaceHost workspaceHost)
+    {
+        _workspaceHost = workspaceHost ?? throw new ArgumentNullException(nameof(workspaceHost));
+    }
+
+    public async Task<ToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (!arguments.HasValue || arguments.Value.ValueKind == JsonValueKind.Null)
+            {
+                return CreateErrorResult("Missing arguments");
+            }
+
+            if (!arguments.Value.TryGetProperty("fullyQualifiedName", out var fqnElement))
+            {
+                return CreateErrorResult("Missing required field: fullyQualifiedName");
+            }
+
+            var fullyQualifiedName = fqnElement.GetString();
+            if (string.IsNullOrEmpty(fullyQualifiedName))
+            {
+                return CreateErrorResult("fullyQualifiedName cannot be empty");
+            }
+
+            var solution = _workspaceHost.GetSolution();
+            if (solution == null)
+            {
+                return CreateErrorResult("No solution loaded. Please load a solution first.");
+            }
+
+            Console.Error.WriteLine($"GotoDefinition: Finding symbol {fullyQualifiedName}");
+
+            // Find symbol by FQN
+            ISymbol? symbol = null;
+            foreach (var project in solution.Projects)
+            {
+                var compilation = await project.GetCompilationAsync(cancellationToken);
+                if (compilation == null) continue;
+
+                symbol = compilation.GetTypeByMetadataName(fullyQualifiedName);
+                if (symbol != null)
+                {
+                    Console.Error.WriteLine($"Found type symbol in project: {project.Name}");
+                    break;
+                }
+
+                // Try to find method or property by parsing the name
+                if (fullyQualifiedName.Contains("."))
+                {
+                    var lastDot = fullyQualifiedName.LastIndexOf('.');
+                    if (lastDot > 0)
+                    {
+                        var typeName = fullyQualifiedName.Substring(0, lastDot);
+                        var memberName = fullyQualifiedName.Substring(lastDot + 1);
+                        
+                        // Remove method parameters if present
+                        var parenIndex = memberName.IndexOf('(');
+                        if (parenIndex > 0)
+                        {
+                            memberName = memberName.Substring(0, parenIndex);
+                        }
+
+                        var type = compilation.GetTypeByMetadataName(typeName);
+                        if (type != null)
+                        {
+                            symbol = type.GetMembers(memberName).FirstOrDefault();
+                            if (symbol != null)
+                            {
+                                Console.Error.WriteLine($"Found member symbol in project: {project.Name}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (symbol == null)
+            {
+                return CreateErrorResult($"Symbol not found: {fullyQualifiedName}");
+            }
+
+            // Try to find source definition
+            Console.Error.WriteLine($"Finding source definition for {symbol.ToDisplayString()}");
+            var sourceDefinition = await SymbolFinder.FindSourceDefinitionAsync(symbol, solution, cancellationToken);
+            
+            // If no source definition found, use the original symbol (might be from metadata)
+            var definitionSymbol = sourceDefinition ?? symbol;
+            Console.Error.WriteLine($"Using {(sourceDefinition != null ? "source" : "metadata")} definition");
+
+            // Get the definition location
+            var description = SymbolFormatting.Describe(definitionSymbol);
+            
+            var result = new
+            {
+                success = true,
+                display = description.Display,
+                file = description.File,
+                line = description.Line,
+                column = description.Column,
+                isSourceDefinition = sourceDefinition != null,
+                isFromMetadata = sourceDefinition == null && !definitionSymbol.Locations.Any(loc => loc.IsInSource),
+                kind = definitionSymbol.Kind.ToString(),
+                containingType = definitionSymbol.ContainingType?.ToDisplayString(),
+                containingNamespace = definitionSymbol.ContainingNamespace?.ToDisplayString()
+            };
+
+            var elem = JsonSerializer.SerializeToElement(result);
+            return new ToolCallResult
+            {
+                Content = new[]
+                {
+                    new ToolContent
+                    {
+                        Type = "text",
+                        Text = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true })
+                    }
+                }.ToList(),
+                StructuredContent = elem
+            };
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"GotoDefinitionTool error: {ex}");
+            return CreateErrorResult($"Exception: {ex.Message}");
+        }
+    }
+
+    private ToolCallResult CreateErrorResult(string message)
+    {
+        var result = new { success = false, error = message };
+        
+        return new ToolCallResult
+        {
+            IsError = true,
+            Content = new[]
+            {
+                new ToolContent
+                {
+                    Type = "text",
+                    Text = JsonSerializer.Serialize(result)
+                }
+            }.ToList()
+        };
+    }
+}
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using RoslynMcpServer.Infrastructure;
+using RoslynMcpServer.Roslyn;
+
+namespace RoslynMcpServer.Tools;
+
+public class LoadSolutionTool
+{
+    private readonly WorkspaceHost _workspaceHost;
+
+    public LoadSolutionTool(WorkspaceHost workspaceHost)
+    {
+        _workspaceHost = workspaceHost ?? throw new ArgumentNullException(nameof(workspaceHost));
+    }
+
+    public async Task<ToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            Console.Error.WriteLine($"LoadSolutionTool.ExecuteAsync called with arguments: {arguments?.ToString() ?? "null"}");
+            
+            if (!arguments.HasValue || arguments.Value.ValueKind == JsonValueKind.Null || arguments.Value.ValueKind == JsonValueKind.Undefined)
+            {
+                return CreateErrorResult("Missing arguments");
+            }
+
+            if (!arguments.Value.TryGetProperty("path", out var pathElement))
+            {
+                return CreateErrorResult("Missing 'path' argument");
+            }
+
+            var solutionPath = pathElement.GetString();
+            if (string.IsNullOrEmpty(solutionPath))
+            {
+                return CreateErrorResult("Solution path cannot be empty");
+            }
+
+            if (!File.Exists(solutionPath))
+            {
+                return CreateErrorResult($"Solution file not found: {solutionPath}");
+            }
+
+            Console.Error.WriteLine($"Loading: {solutionPath}");
+            
+            // Call the actual loading with cancellation token
+            var success = await _workspaceHost.OpenSolutionAsync(solutionPath, cancellationToken);
+            
+            if (!success)
+            {
+                return CreateErrorResult($"Failed to load solution/project. Check stderr for detailed logs (WorkspaceFailed events, progress)");
+            }
+
+            var solution = _workspaceHost.GetSolution();
+            if (solution == null)
+            {
+                return CreateErrorResult("Solution is null after loading");
+            }
+
+            var projects = new List<object>();
+            foreach (var project in solution.Projects)
+            {
+                var tfm = GetTargetFramework(project);
+                projects.Add(new
+                {
+                    name = project.Name,
+                    tfm = tfm ?? "unknown"
+                });
+                
+                Console.Error.WriteLine($"  Project: {project.Name} (TFM: {tfm ?? "unknown"})");
+            }
+
+            var loadMode = _workspaceHost.GetLoadMode();
+            Console.Error.WriteLine($"Solution load mode: {loadMode ?? "unknown"}");
+            var result = new
+            {
+                success = true,
+                solutionPath = solution.FilePath,
+                projectCount = projects.Count,
+                mode = loadMode ?? "unknown",
+                projects = projects
+            };
+
+            // Return text plus structured content according to MCP
+            var jsonText = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+            var elem = JsonSerializer.SerializeToElement(result);
+
+            return new ToolCallResult
+            {
+                Content = new List<ToolContent>
+                {
+                    new ToolContent
+                    {
+                        Type = "text",
+                        Text = jsonText
+                    }
+                },
+                StructuredContent = elem
+            };
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"LoadSolutionTool error: {ex}");
+            return CreateErrorResult($"Exception: {ex.Message}");
+        }
+    }
+
+    private string? GetTargetFramework(Project project)
+    {
+        try
+        {
+            if (project.CompilationOptions == null)
+                return null;
+
+            var analyzerConfigOptions = project.AnalyzerOptions.AnalyzerConfigOptionsProvider;
+            var globalOptions = analyzerConfigOptions?.GlobalOptions;
+            
+            if (globalOptions != null && globalOptions.TryGetValue("build_property.TargetFramework", out var tfm))
+            {
+                return tfm;
+            }
+
+            var msbuildProperties = project.ParseOptions?.PreprocessorSymbolNames
+                .FirstOrDefault(s => s.StartsWith("NET") || s.StartsWith("NETCOREAPP") || s.StartsWith("NETSTANDARD"));
+            
+            if (!string.IsNullOrEmpty(msbuildProperties))
+            {
+                return msbuildProperties.ToLowerInvariant().Replace("_", ".");
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private ToolCallResult CreateErrorResult(string message)
+    {
+        return new ToolCallResult
+        {
+            IsError = true,
+            Content = new List<ToolContent>
+            {
+                new ToolContent
+                {
+                    Type = "text",
+                    Text = JsonSerializer.Serialize(new 
+                    { 
+                        success = false, 
+                        error = message 
+                    })
+                }
+            }
+        };
+    }
+}
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using RoslynMcpServer.Infrastructure;
+using RoslynMcpServer.Roslyn;
+
+namespace RoslynMcpServer.Tools;
+
+/// <summary>
+/// Test tool to demonstrate SymbolFormatting.Describe functionality
+/// </summary>
+public class TestSymbolFormattingTool
+{
+    private readonly WorkspaceHost _workspaceHost;
+
+    public TestSymbolFormattingTool(WorkspaceHost workspaceHost)
+    {
+        _workspaceHost = workspaceHost;
+    }
+
+    public async Task<ToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var solution = _workspaceHost.GetSolution();
+            if (solution == null)
+            {
+                return CreateErrorResult("No solution loaded. Please load a solution first.");
+            }
+
+            var results = new List<object>();
+
+            // Test with first project
+            var project = solution.Projects.FirstOrDefault();
+            if (project == null)
+            {
+                return CreateErrorResult("No projects in solution");
+            }
+
+            var compilation = await project.GetCompilationAsync(cancellationToken);
+            if (compilation == null)
+            {
+                return CreateErrorResult("Failed to get compilation");
+            }
+
+            // Find some symbols to test
+            foreach (var document in project.Documents.Take(3))
+            {
+                var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
+                if (syntaxTree == null) continue;
+
+                var semanticModel = compilation.GetSemanticModel(syntaxTree);
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
+
+                // Find class declarations
+                var classDeclarations = root.DescendantNodes()
+                    .OfType<ClassDeclarationSyntax>()
+                    .Take(2);
+
+                foreach (var classDecl in classDeclarations)
+                {
+                    var symbol = semanticModel.GetDeclaredSymbol(classDecl);
+                    if (symbol != null)
+                    {
+                        var description = SymbolFormatting.Describe(symbol);
+                        results.Add(new
+                        {
+                            kind = "class",
+                            display = description.Display,
+                            file = description.File,
+                            line = description.Line,
+                            column = description.Column,
+                            formatted = description.ToString()
+                        });
+                    }
+                }
+
+                // Find method declarations
+                var methodDeclarations = root.DescendantNodes()
+                    .OfType<MethodDeclarationSyntax>()
+                    .Take(2);
+
+                foreach (var methodDecl in methodDeclarations)
+                {
+                    var symbol = semanticModel.GetDeclaredSymbol(methodDecl);
+                    if (symbol != null)
+                    {
+                        var description = SymbolFormatting.Describe(symbol);
+                        results.Add(new
+                        {
+                            kind = "method",
+                            display = description.Display,
+                            file = description.File,
+                            line = description.Line,
+                            column = description.Column,
+                            formatted = description.ToString()
+                        });
+                    }
+                }
+            }
+
+            // Test with a metadata symbol (e.g., System.String)
+            var stringSymbol = compilation.GetTypeByMetadataName("System.String");
+            if (stringSymbol != null)
+            {
+                var description = SymbolFormatting.Describe(stringSymbol);
+                results.Add(new
+                {
+                    kind = "metadata",
+                    display = description.Display,
+                    file = description.File,
+                    line = description.Line,
+                    column = description.Column,
+                    formatted = description.ToString()
+                });
+            }
+
+            var result = new
+            {
+                success = true,
+                symbolCount = results.Count,
+                symbols = results
+            };
+
+            var elem = JsonSerializer.SerializeToElement(result);
+            return new ToolCallResult
+            {
+                Content = new List<ToolContent>
+                {
+                    new ToolContent
+                    {
+                        Type = "text",
+                        Text = JsonSerializer.Serialize(result, new JsonSerializerOptions 
+                        { 
+                            WriteIndented = true 
+                        })
+                    }
+                },
+                StructuredContent = elem
+            };
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"TestSymbolFormattingTool error: {ex}");
+            return CreateErrorResult($"Exception: {ex.Message}");
+        }
+    }
+
+    private ToolCallResult CreateErrorResult(string message)
+    {
+        return new ToolCallResult
+        {
+            IsError = true,
+            Content = new List<ToolContent>
+            {
+                new ToolContent
+                {
+                    Type = "text",
+                    Text = JsonSerializer.Serialize(new 
+                    { 
+                        success = false, 
+                        error = message 
+                    })
+                }
+            }
+        };
+    }
+}

@@ -141,10 +141,8 @@ public class GetTypeInfoTool
                 result["nextCursor"] = $"page={page + 1}";
             }
 
-            var jsonText = JsonSerializer.Serialize(result, new JsonSerializerOptions 
-            { 
-                WriteIndented = true 
-            });
+            var jsonText = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+            var elem = JsonSerializer.SerializeToElement(result);
 
             return new ToolCallResult
             {
@@ -156,7 +154,7 @@ public class GetTypeInfoTool
                         Text = jsonText
                     }
                 },
-                StructuredContent = result
+                StructuredContent = elem
             };
         }
         catch (Exception ex)

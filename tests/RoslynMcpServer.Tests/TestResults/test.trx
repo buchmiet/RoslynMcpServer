@@ -1,0 +1,96 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="4f0e591b-cef8-4687-a0ef-ed04d34b67c7" name="@Cray 2025-08-22 19:33:10" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2025-08-22T19:33:10.7355992+01:00" queuing="2025-08-22T19:33:10.7355992+01:00" start="2025-08-22T19:33:08.8095336+01:00" finish="2025-08-22T19:33:10.7392055+01:00" />
+  <TestSettings name="default" id="691ca675-70ad-459b-ae73-e20c51103ffb">
+    <Deployment runDeploymentRoot="_Cray_2025-08-22_19_33_10" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="ad784d6e-e3c0-4b61-81be-e57a8328b57f" testId="7d403ef7-81dc-159c-5ac0-909dedbd349a" testName="RoslynMcpServer.Tests.ToolTests.GetTypeInfo_ReturnsMembers_ForMathUtils" computerName="Cray" duration="00:00:00.0010000" startTime="2025-08-22T19:33:10.6778424+01:00" endTime="2025-08-22T19:33:10.6778513+01:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ad784d6e-e3c0-4b61-81be-e57a8328b57f">
+      <Output>
+        <ErrorInfo>
+          <Message>Expected res.IsError to be false because {
+  "success": true,
+  "solutionPath": null,
+  "projectCount": 1,
+  "mode": "project",
+  "projects": [
+    {
+      "name": "SampleApp",
+      "tfm": "net9.0"
+    }
+  ]
+}, but found &lt;null&gt;.</Message>
+          <StackTrace>   at FluentAssertions.Execution.XUnit2TestFramework.Throw(String message)
+   at FluentAssertions.Execution.TestFrameworkProvider.Throw(String message)
+   at FluentAssertions.Execution.DefaultAssertionStrategy.HandleFailure(String message)
+   at FluentAssertions.Execution.AssertionScope.FailWith(Func`1 failReasonFunc)
+   at FluentAssertions.Execution.AssertionScope.FailWith(Func`1 failReasonFunc)
+   at FluentAssertions.Execution.AssertionScope.FailWith(String message, Object[] args)
+   at FluentAssertions.Primitives.BooleanAssertions`1.BeFalse(String because, Object[] becauseArgs)
+   at RoslynMcpServer.Tests.ToolTests.InitializeAsync() in /mnt/c/Users/newon/source/repos/RoslynMcpServer/tests/RoslynMcpServer.Tests/ToolTests.cs:line 47</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="RoslynMcpServer.Tests.ToolTests.GetTypeInfo_ReturnsMembers_ForMathUtils" storage="/mnt/c/users/newon/source/repos/roslynmcpserver/tests/roslynmcpserver.tests/bin/debug/net9.0/roslynmcpserver.tests.dll" id="7d403ef7-81dc-159c-5ac0-909dedbd349a">
+      <Execution id="ad784d6e-e3c0-4b61-81be-e57a8328b57f" />
+      <TestMethod codeBase="/mnt/c/Users/newon/source/repos/RoslynMcpServer/tests/RoslynMcpServer.Tests/bin/Debug/net9.0/RoslynMcpServer.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="RoslynMcpServer.Tests.ToolTests" name="GetTypeInfo_ReturnsMembers_ForMathUtils" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="7d403ef7-81dc-159c-5ac0-909dedbd349a" executionId="ad784d6e-e3c0-4b61-81be-e57a8328b57f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="1" executed="1" passed="0" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.8.2+699d445a1a (64-bit .NET 9.0.8)
+[xUnit.net 00:00:00.07]   Discovering: RoslynMcpServer.Tests
+[xUnit.net 00:00:00.08]   Discovered:  RoslynMcpServer.Tests
+[xUnit.net 00:00:00.09]   Starting:    RoslynMcpServer.Tests
+LoadSolutionTool.ExecuteAsync called with arguments: {"path":"/mnt/c/Users/newon/source/repos/RoslynMcpServer/samples/SampleApp/SampleApp.csproj"}
+Loading: /mnt/c/Users/newon/source/repos/RoslynMcpServer/samples/SampleApp/SampleApp.csproj
+Opening: /mnt/c/Users/newon/source/repos/RoslynMcpServer/samples/SampleApp/SampleApp.csproj
+Loading as project file...
+Loading /mnt/c/Users/newon/source/repos/RoslynMcpServer/samples/SampleApp/SampleApp.csproj (unknown)
+Loading /mnt/c/Users/newon/source/repos/RoslynMcpServer/samples/SampleApp/SampleApp.csproj (unknown)
+Loading /mnt/c/Users/newon/source/repos/RoslynMcpServer/samples/SampleApp/SampleApp.csproj (net9.0)
+Solution loaded: /mnt/c/Users/newon/source/repos/RoslynMcpServer/samples/SampleApp/SampleApp.csproj
+Projects count: 1
+  Project: SampleApp (TFM: net9.0)
+Solution load mode: project
+[xUnit.net 00:00:01.56]       Expected res.IsError to be false because {
+[xUnit.net 00:00:01.56]         "success": true,
+[xUnit.net 00:00:01.56]         "solutionPath": null,
+[xUnit.net 00:00:01.56]         "projectCount": 1,
+[xUnit.net 00:00:01.56]         "mode": "project",
+[xUnit.net 00:00:01.56]         "projects": [
+[xUnit.net 00:00:01.56]           {
+[xUnit.net 00:00:01.56]             "name": "SampleApp",
+[xUnit.net 00:00:01.56]             "tfm": "net9.0"
+[xUnit.net 00:00:01.56]           }
+[xUnit.net 00:00:01.56]         ]
+[xUnit.net 00:00:01.56]       }, but found &lt;null&gt;.
+[xUnit.net 00:00:01.56]       Stack Trace:
+[xUnit.net 00:00:01.56]            at FluentAssertions.Execution.XUnit2TestFramework.Throw(String message)
+[xUnit.net 00:00:01.56]            at FluentAssertions.Execution.TestFrameworkProvider.Throw(String message)
+[xUnit.net 00:00:01.56]            at FluentAssertions.Execution.DefaultAssertionStrategy.HandleFailure(String message)
+[xUnit.net 00:00:01.56]            at FluentAssertions.Execution.AssertionScope.FailWith(Func`1 failReasonFunc)
+[xUnit.net 00:00:01.56]            at FluentAssertions.Execution.AssertionScope.FailWith(Func`1 failReasonFunc)
+[xUnit.net 00:00:01.56]            at FluentAssertions.Execution.AssertionScope.FailWith(String message, Object[] args)
+[xUnit.net 00:00:01.56]            at FluentAssertions.Primitives.BooleanAssertions`1.BeFalse(String because, Object[] becauseArgs)
+[xUnit.net 00:00:01.56]         /mnt/c/Users/newon/source/repos/RoslynMcpServer/tests/RoslynMcpServer.Tests/ToolTests.cs(47,0): at RoslynMcpServer.Tests.ToolTests.InitializeAsync()
+[xUnit.net 00:00:01.56]   Finished:    RoslynMcpServer.Tests
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="Cray" outcome="Error" timestamp="2025-08-22T19:33:10.6764977+01:00">
+        <Text>[xUnit.net 00:00:01.56]     RoslynMcpServer.Tests.ToolTests.GetTypeInfo_ReturnsMembers_ForMathUtils [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

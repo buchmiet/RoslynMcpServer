@@ -1,6 +1,9 @@
 using System;
+using System.IO;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using RoslynMcpServer.Infrastructure;
+using Serilog;
 
 namespace RoslynMcpServer;
 
@@ -12,12 +15,31 @@ public class Program
         Environment.SetEnvironmentVariable("DOTNET_NOLOGO", "1");
         Environment.SetEnvironmentVariable("DOTNET_CLI_TELEMETRY_OPTOUT", "1");
 
+        // Configure Serilog - only for tool usage logging
+        var logDirectory = AppDomain.CurrentDomain.BaseDirectory;
+        var logPath = Path.Combine(logDirectory, "tooluse.log");
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Information()
+            .WriteTo.File(logPath,
+                rollingInterval: RollingInterval.Day,
+                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}",
+                flushToDiskInterval: TimeSpan.FromSeconds(1))
+            .CreateLogger();
+        
+        Console.Error.WriteLine($"MCP: Logging to {logDirectory}tooluse{{YYYYMMDD}}.log");
+
+        var loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.AddSerilog(Log.Logger);
+        });
+
         try
         {
             // Krótki log na STDERR (stdout MUSI być czysty dla MCP)
             Console.Error.WriteLine("MCP: starting (NDJSON over stdio)...");
             
-            var mcpServer  = new McpServer();
+            var logger = loggerFactory.CreateLogger<McpServer>();
+            var mcpServer  = new McpServer(logger);
             var jsonRpcLoop = new JsonRpcLoop();
 
             Console.Error.WriteLine("MCP: listening...");
@@ -31,6 +53,10 @@ public class Program
         {
             Console.Error.WriteLine($"Fatal error: {ex}");
             Environment.Exit(1);
+        }
+        finally
+        {
+            Log.CloseAndFlush();
         }
     }
 }

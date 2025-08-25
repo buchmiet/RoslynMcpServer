@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using StreamJsonRpc;
 using RoslynMcpServer.Roslyn;
 using RoslynMcpServer.Tools;
@@ -15,23 +16,31 @@ public class McpServer
     private const string ServerName = "roslyn-mcp-server";
     private const string ServerVersion = "1.0.0";
     
+    private readonly ILogger<McpServer> _logger;
     private readonly WorkspaceHost _workspaceHost;
-    private readonly LoadSolutionTool _loadSolutionTool;
+    private readonly LoadProjectTool _loadProjectTool;
     private readonly TestSymbolFormattingTool _testSymbolFormattingTool;
     private readonly GetTypeInfoTool _getTypeInfoTool;
     private readonly FindReferencesTool _findReferencesTool;
     private readonly DescribeSymbolTool _describeSymbolTool;
     private readonly GotoDefinitionTool _gotoDefinitionTool;
+    private readonly GetMethodDependenciesTool _getMethodDependenciesTool;
+    private readonly GetInheritanceTreeTool _getInheritanceTreeTool;
+    private readonly GetAllImplementationsTool _getAllImplementationsTool;
 
-    public McpServer()
+    public McpServer(ILogger<McpServer> logger)
     {
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _workspaceHost = new WorkspaceHost();
-        _loadSolutionTool = new LoadSolutionTool(_workspaceHost);
+        _loadProjectTool = new LoadProjectTool(_workspaceHost);
         _testSymbolFormattingTool = new TestSymbolFormattingTool(_workspaceHost);
         _getTypeInfoTool = new GetTypeInfoTool(_workspaceHost);
         _findReferencesTool = new FindReferencesTool(_workspaceHost);
         _describeSymbolTool = new DescribeSymbolTool(_workspaceHost);
         _gotoDefinitionTool = new GotoDefinitionTool(_workspaceHost);
+        _getMethodDependenciesTool = new GetMethodDependenciesTool(_workspaceHost);
+        _getInheritanceTreeTool = new GetInheritanceTreeTool(_workspaceHost);
+        _getAllImplementationsTool = new GetAllImplementationsTool(_workspaceHost);
     }
 
     // MCP handshake: catch-all initialize (object params)
@@ -186,7 +195,7 @@ public class McpServer
                 Tools = new ToolsCapability { ListChanged = false },
                 Experimental = new { }
             },
-            Instructions = "Use tools/list then tools/call; load_solution first."
+            Instructions = "Use tools/list then tools/call; load_project first."
         };
         
         return Task.FromResult(result);
@@ -209,8 +218,8 @@ public class McpServer
         {
             new Tool
             {
-                Name = "load_solution",
-                Description = "Load a .NET solution (.sln) or project file (.csproj) for analysis",
+                Name = "load_project",
+                Description = "Load a .NET project file (.csproj) or solution (.sln) for analysis. Prefer .csproj files. Use ABSOLUTE paths only!",
                 InputSchema = new
                 {
                     type = "object",
@@ -219,7 +228,7 @@ public class McpServer
                         path = new
                         {
                             type = "string",
-                            description = "Path to the .sln or .csproj file"
+                            description = "ABSOLUTE path to the .csproj (preferred) or .sln file. Must be a full absolute path!"
                         }
                     },
                     required = new[] { "path" }
@@ -256,6 +265,52 @@ public class McpServer
                         }
                     },
                     required = new[] { "fullyQualifiedName" }
+                }
+            },
+            new Tool
+            {
+                Name = "get_inheritance_tree",
+                Description = "Return full inheritance tree (ancestors, interfaces, descendants; optional overrides)",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new { type = "string" },
+                        file = new { type = "string" },
+                        line = new { type = "integer", minimum = 1 },
+                        column = new { type = "integer", minimum = 1 },
+                        direction = new { type = "string", enumValues = new[] { "both", "ancestors", "descendants" }, _default = "both" },
+                        includeInterfaces = new { type = "boolean", _default = true },
+                        includeOverrides = new { type = "boolean", _default = false },
+                        maxDepth = new { type = "integer", minimum = 1, maximum = 100, _default = 10 },
+                        solutionOnly = new { type = "boolean", _default = true },
+                        page = new { type = "integer", minimum = 1, _default = 1 },
+                        pageSize = new { type = "integer", minimum = 1, maximum = 500, _default = 200 },
+                        timeoutMs = new { type = "integer", minimum = 1000, maximum = 300000, _default = 60000 }
+                    }
+                }
+            },
+            new Tool
+            {
+                Name = "get_all_implementations",
+                Description = "List all implementations of an interface, or implementations of a specific interface member",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new { type = "string" },
+                        file = new { type = "string" },
+                        line = new { type = "integer", minimum = 1 },
+                        column = new { type = "integer", minimum = 1 },
+                        member = new { type = "string", description = "Optional member name when FQN targets interface type" },
+                        solutionOnly = new { type = "boolean", _default = true },
+                        includeDerivedInterfaces = new { type = "boolean", _default = true },
+                        page = new { type = "integer", minimum = 1, _default = 1 },
+                        pageSize = new { type = "integer", minimum = 1, maximum = 500, _default = 200 },
+                        timeoutMs = new { type = "integer", minimum = 1000, maximum = 300000, _default = 60000 }
+                    }
                 }
             },
             new Tool
@@ -359,7 +414,30 @@ public class McpServer
                     },
                     required = new[] { "fullyQualifiedName" }
                 }
+            },
+            new Tool
+            {
+                Name = "get_method_dependencies",
+                Description = "Analyze method dependencies: calls, reads/writes of fields/properties; optional callers",
+                InputSchema = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        fullyQualifiedName = new { type = "string", description = "Fully qualified name (or use file/line/column)" },
+                        file = new { type = "string" },
+                        line = new { type = "integer", minimum = 1 },
+                        column = new { type = "integer", minimum = 1 },
+                        depth = new { type = "integer", minimum = 1, @default = 1 },
+                        includeCallers = new { type = "boolean", @default = false },
+                        treatPropertiesAsMethods = new { type = "boolean", @default = true },
+                        page = new { type = "integer", minimum = 1, @default = 1 },
+                        pageSize = new { type = "integer", minimum = 1, maximum = 500, @default = 200 },
+                        timeoutMs = new { type = "integer", minimum = 1000, maximum = 300000, @default = 60000 }
+                    }
+                }
             }
+
         };
 
         return Task.FromResult(new ToolsListResult { Tools = tools });
@@ -382,10 +460,18 @@ public class McpServer
         var name = parameters?.Name;
         var arguments = parameters?.Arguments;
         
+        // Log tool usage
+        _logger.LogInformation("Tool: {ToolName} | Parameters: {Parameters}", 
+            name ?? "unknown", 
+            arguments?.ToString() ?? "null");
+        
         switch (name)
         {
-            case "load_solution":
-                return await _loadSolutionTool.ExecuteAsync(arguments);
+            case "load_project":
+                return await _loadProjectTool.ExecuteAsync(arguments);
+                
+            case "load_solution": // Keep for backward compatibility
+                return await _loadProjectTool.ExecuteAsync(arguments);
                 
             case "test_symbol_formatting":
                 return await _testSymbolFormattingTool.ExecuteAsync(arguments);
@@ -402,18 +488,27 @@ public class McpServer
             case "goto_definition":
                 return await _gotoDefinitionTool.ExecuteAsync(arguments, cancellationToken);
             
+            case "get_method_dependencies":
+                return await _getMethodDependenciesTool.ExecuteAsync(arguments, cancellationToken);
+
+            case "get_inheritance_tree":
+                return await _getInheritanceTreeTool.ExecuteAsync(arguments, cancellationToken);
+
+            case "get_all_implementations":
+                return await _getAllImplementationsTool.ExecuteAsync(arguments, cancellationToken);
+
             default:
                 return new ToolCallResult
                 {
                     IsError = true,
-                    Content = new List<ToolContent>
-                    {
+                    Content =
+                    [
                         new ToolContent
                         {
                             Type = "text",
                             Text = $"Unknown tool: {name}"
                         }
-                    }
+                    ]
                 };
         }
     }

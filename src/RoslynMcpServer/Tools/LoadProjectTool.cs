@@ -11,11 +11,11 @@ using RoslynMcpServer.Roslyn;
 
 namespace RoslynMcpServer.Tools;
 
-public class LoadSolutionTool
+public class LoadProjectTool
 {
     private readonly WorkspaceHost _workspaceHost;
 
-    public LoadSolutionTool(WorkspaceHost workspaceHost)
+    public LoadProjectTool(WorkspaceHost workspaceHost)
     {
         _workspaceHost = workspaceHost ?? throw new ArgumentNullException(nameof(workspaceHost));
     }
@@ -24,7 +24,7 @@ public class LoadSolutionTool
     {
         try
         {
-            Console.Error.WriteLine($"LoadSolutionTool.ExecuteAsync called with arguments: {arguments?.ToString() ?? "null"}");
+            Console.Error.WriteLine($"LoadProjectTool.ExecuteAsync called with arguments: {arguments?.ToString() ?? "null"}");
             
             if (!arguments.HasValue || arguments.Value.ValueKind == JsonValueKind.Null || arguments.Value.ValueKind == JsonValueKind.Undefined)
             {
@@ -36,25 +36,31 @@ public class LoadSolutionTool
                 return CreateErrorResult("Missing 'path' argument");
             }
 
-            var solutionPath = pathElement.GetString();
-            if (string.IsNullOrEmpty(solutionPath))
+            var projectPath = pathElement.GetString();
+            if (string.IsNullOrEmpty(projectPath))
             {
-                return CreateErrorResult("Solution path cannot be empty");
+                return CreateErrorResult("Project path cannot be empty. Use ABSOLUTE path to .csproj (preferred) or .sln file.");
             }
 
-            if (!File.Exists(solutionPath))
+            // Check if path is absolute
+            if (!Path.IsPathRooted(projectPath))
             {
-                return CreateErrorResult($"Solution file not found: {solutionPath}");
+                return CreateErrorResult($"Path must be ABSOLUTE. Got relative path: {projectPath}. Use full absolute path to .csproj or .sln file.");
             }
 
-            Console.Error.WriteLine($"Loading: {solutionPath}");
+            if (!File.Exists(projectPath))
+            {
+                return CreateErrorResult($"Project/solution file not found: {projectPath}. Ensure the ABSOLUTE path to .csproj (preferred) or .sln file is correct.");
+            }
+
+            Console.Error.WriteLine($"Loading: {projectPath}");
             
             // Call the actual loading with cancellation token
-            var success = await _workspaceHost.OpenSolutionAsync(solutionPath, cancellationToken);
+            var success = await _workspaceHost.OpenSolutionAsync(projectPath, cancellationToken);
             
             if (!success)
             {
-                return CreateErrorResult($"Failed to load solution/project. Check stderr for detailed logs (WorkspaceFailed events, progress)");
+                return CreateErrorResult($"Failed to load project/solution. Check stderr for detailed logs (WorkspaceFailed events, progress). Make sure to use ABSOLUTE path to .csproj file.");
             }
 
             var solution = _workspaceHost.GetSolution();
@@ -89,6 +95,7 @@ public class LoadSolutionTool
 
             // Return text plus structured content according to MCP
             var jsonText = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+            var elem = JsonSerializer.SerializeToElement(result);
 
             return new ToolCallResult
             {
@@ -100,7 +107,7 @@ public class LoadSolutionTool
                         Text = jsonText
                     }
                 },
-                StructuredContent = result
+                StructuredContent = elem
             };
         }
         catch (Exception ex)

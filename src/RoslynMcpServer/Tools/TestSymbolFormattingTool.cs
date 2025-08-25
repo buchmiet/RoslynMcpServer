@@ -128,6 +128,7 @@ public class TestSymbolFormattingTool
                 symbols = results
             };
 
+            var elem = JsonSerializer.SerializeToElement(result);
             return new ToolCallResult
             {
                 Content = new List<ToolContent>
@@ -141,7 +142,7 @@ public class TestSymbolFormattingTool
                         })
                     }
                 },
-                StructuredContent = result
+                StructuredContent = elem
             };
         }
         catch (Exception ex)

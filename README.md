@@ -278,6 +278,197 @@ Find the source definition of a symbol. If the source is not available, returns 
 }
 ```
 
+### 6. get_method_dependencies
+
+Analyze method body and list called methods and member reads/writes; optionally include callers of the root method.
+
+Parameters:
+- `fullyQualifiedName` (string) or `file`+`line`+`column`: Target method/property accessor
+- `depth` (integer, optional): Traversal depth for transitive calls (default: 1)
+- `includeCallers` (boolean, optional): Include list of callers of the root (default: false)
+- `treatPropertiesAsMethods` (boolean, optional): Report get_/set_ as calls (default: true)
+- `page`, `pageSize` (integers, optional): Pagination for the `calls` list (default: 1 / 200)
+- `timeoutMs` (integer, optional): 1000–300000 (default: 60000)
+
+Example:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": [{
+    "name": "get_method_dependencies",
+    "arguments": {
+      "fullyQualifiedName": "MyApp.Core.Utils.DoWork",
+      "depth": 2,
+      "includeCallers": true,
+      "pageSize": 200
+    }
+  }],
+  "id": 7
+}
+```
+
+Response (abridged):
+```json
+{
+  "success": true,
+  "symbol": {"display": "int MyApp.Core.Utils.DoWork()", "file": "/.../Utils.cs", "line": 10, "column": 17},
+  "totalCalls": 4,
+  "calls": [{"display": "void MyApp.Core.Helper.Log()", "file": "/.../Helper.cs", "line": 5, "column": 17}],
+  "reads": [{"display": "int MyApp.Core.Utils.Counter", "file": "/.../Utils.cs", "line": 4, "column": 19}],
+  "writes": [{"display": "int MyApp.Core.Utils.Counter", "file": "/.../Utils.cs", "line": 4, "column": 19}],
+  "callers": [{"display": "int MyApp.Services.Svc.Run()", "file": "/.../Svc.cs", "line": 12, "column": 15}]
+}
+```
+
+### STDIO Examples (CLI)
+
+All tools communicate via MCP over STDIO using NDJSON. Below are quick CLI snippets using `printf` piped into the running server.
+
+Note: Load a solution or project first.
+
+```bash
+# Load solution or project
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"load_solution","arguments":{"path":"/absolute/path/to/your.sln"}}],"id":1}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+get_method_dependencies:
+```bash
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"get_method_dependencies","arguments":{"fullyQualifiedName":"MyApp.Core.Utils.DoWork","depth":2,"includeCallers":true}}],"id":2}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+get_inheritance_tree:
+```bash
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"get_inheritance_tree","arguments":{"fullyQualifiedName":"MyApp.Core.BaseType","direction":"descendants","includeInterfaces":true}}],"id":3}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+get_all_implementations:
+```bash
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"get_all_implementations","arguments":{"fullyQualifiedName":"MyApp.Core.IMyInterface","includeDerivedInterfaces":true}}],"id":4}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+get_type_info:
+```bash
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"get_type_info","arguments":{"fullyQualifiedName":"System.String","pageSize":10}}],"id":5}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+find_references:
+```bash
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"find_references","arguments":{"fullyQualifiedName":"MyApp.Core.SomeType","pageSize":50}}],"id":6}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+describe_symbol (by name):
+```bash
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"describe_symbol","arguments":{"fullyQualifiedName":"System.Console.WriteLine"}}],"id":7}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+describe_symbol (by position):
+```bash
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"describe_symbol","arguments":{"file":"/absolute/path/to/File.cs","line":42,"column":15}}],"id":8}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+goto_definition:
+```bash
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"goto_definition","arguments":{"fullyQualifiedName":"MyApp.Core.SomeType.SomeMethod"}}],"id":9}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+test_symbol_formatting:
+```bash
+printf '{"jsonrpc":"2.0","method":"tools/call","params":[{"name":"test_symbol_formatting","arguments":{}}],"id":10}\n' \
+| dotnet run --project src/RoslynMcpServer/RoslynMcpServer.csproj
+```
+
+### 7. get_inheritance_tree
+
+Return full inheritance tree: ancestors chain, implemented interfaces, descendants (transitively), and optionally overrides per member.
+
+Parameters:
+- `fullyQualifiedName` (string) or `file`+`line`+`column`: Target type
+- `direction` (string, optional): `both|ancestors|descendants` (default: `both`)
+- `includeInterfaces` (boolean, optional): Include interfaces (default: true)
+- `includeOverrides` (boolean, optional): Include overrides per member (default: false)
+- `maxDepth` (integer, optional): Depth limit for descendants tree (default: 10)
+- `solutionOnly` (boolean, optional): Only symbols with source in the loaded solution (default: true)
+- `page`, `pageSize` (integers, optional): Pagination for flat descendants list (default: 1 / 200)
+- `timeoutMs` (integer, optional): 1000–300000 (default: 60000)
+
+Example:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": [{
+    "name": "get_inheritance_tree",
+    "arguments": {
+      "fullyQualifiedName": "MyApp.Core.BaseType",
+      "direction": "descendants",
+      "includeInterfaces": true
+    }
+  }],
+  "id": 8
+}
+```
+
+Response (abridged):
+```json
+{
+  "success": true,
+  "root": {"display": "class MyApp.Core.BaseType", "file": "/.../BaseType.cs", "line": 5},
+  "descendantsTree": {"display": "class MyApp.Core.Derived", "children": [...]},
+  "descendantsFlat": [{"display": "class MyApp.Core.Derived"}],
+  "page": 1, "pageSize": 200, "total": 3
+}
+```
+
+### 8. get_all_implementations
+
+List all implementations of an interface type, or implementations of a specific interface member.
+
+Parameters:
+- `fullyQualifiedName` (string) or `file`+`line`+`column`: Target interface or interface member
+- `member` (string, optional): Member name when FQN points to an interface type (e.g., `Compute`)
+- `solutionOnly` (boolean, optional): Only symbols with source in the loaded solution (default: true)
+- `includeDerivedInterfaces` (boolean, optional): Include derived interfaces (default: true)
+- `page`, `pageSize` (integers, optional): Pagination (default: 1 / 200)
+- `timeoutMs` (integer, optional): 1000–300000 (default: 60000)
+
+Example:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": [{
+    "name": "get_all_implementations",
+    "arguments": {
+      "fullyQualifiedName": "MyApp.Core.IMyInterface",
+      "includeDerivedInterfaces": true,
+      "pageSize": 200
+    }
+  }],
+  "id": 9
+}
+```
+
+Response (abridged):
+```json
+{
+  "success": true,
+  "interface": {"display": "interface MyApp.Core.IMyInterface"},
+  "derivedInterfaces": [{"display": "interface MyApp.Core.IMySubInterface"}],
+  "implementations": [{"display": "class MyApp.Core.MyImpl", "file": "/.../MyImpl.cs", "line": 7}],
+  "total": 5
+}
+```
+
 **Response:**
 ```json
 {

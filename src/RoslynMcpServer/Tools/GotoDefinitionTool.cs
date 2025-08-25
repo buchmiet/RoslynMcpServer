@@ -121,6 +121,7 @@ public class GotoDefinitionTool
                 containingNamespace = definitionSymbol.ContainingNamespace?.ToDisplayString()
             };
 
+            var elem = JsonSerializer.SerializeToElement(result);
             return new ToolCallResult
             {
                 Content = new[]
@@ -131,7 +132,7 @@ public class GotoDefinitionTool
                         Text = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true })
                     }
                 }.ToList(),
-                StructuredContent = result
+                StructuredContent = elem
             };
         }
         catch (Exception ex)

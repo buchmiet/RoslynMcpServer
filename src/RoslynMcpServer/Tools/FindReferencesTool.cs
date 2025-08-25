@@ -208,6 +208,7 @@ public class FindReferencesTool
             }
 
             // Return text plus structured content according to MCP
+            var elem = JsonSerializer.SerializeToElement(result);
             return new ToolCallResult
             {
                 Content = new List<ToolContent>
@@ -221,7 +222,7 @@ public class FindReferencesTool
                         })
                     }
                 },
-                StructuredContent = result
+                StructuredContent = elem
             };
         }
         catch (OperationCanceledException)
